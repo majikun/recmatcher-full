@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import List, Dict
 import numpy as np
 import cv2
+from recmatcher.encoder.vpr_embed import VPRemb
 
 def _square_center(img, size):
     h,w = img.shape[:2]
@@ -62,11 +63,12 @@ def _square_hbias(img, size, side):
 
 class QueryReadout:
     """Produce multiple query patches from clip frames (tight/context + L/C/R + mirrored)."""
-    def __init__(self, config: dict, size:int=288, n_frames:int=3, agg:str="gem"):
+    def __init__(self, config: dict, size:int=288, n_frames:int=3, agg:str="gem", vpr: VPRemb | None = None):
         self.cfg = config
         self.size = size
         self.n_frames = n_frames
         self.agg = agg
+        self.vpr = vpr  # lazily initialize if None
 
     def _agg(self, feats: np.ndarray) -> np.ndarray:
         # feats [F,D]
@@ -78,20 +80,19 @@ class QueryReadout:
         return (np.mean(np.power(np.maximum(feats, 1e-6), p), axis=0))**(1.0/p)
 
     def _embed_imgs(self, imgs: List[np.ndarray]) -> np.ndarray:
-        # lightweight RGB stats embedding to keep runnable
-        arr = np.stack(imgs, axis=0).astype(np.float32)/255.0
-        # per-frame embed: mean RGB + std + HSV 12-bin
-        vecs=[]
-        for a in arr:
-            m = a.mean(axis=(0,1)); s = a.std(axis=(0,1))
-            small = cv2.resize(a, (64,64))
-            hsv = cv2.cvtColor((small*255).astype(np.uint8), cv2.COLOR_RGB2HSV)
-            h = np.histogram(hsv[:,:,0], bins=12, range=(0,255))[0].astype(np.float32)
-            h = h/(np.linalg.norm(h)+1e-6)
-            v = np.concatenate([m,s,h], axis=0)
-            vecs.append(v)
-        V = np.stack(vecs, axis=0)
-        return self._agg(V)
+        # imgs: list of [H,W,C] RGB frames. Pack into a single time clip [T,H,W,C]
+        if len(imgs) == 0:
+            return np.zeros((self.vpr.embed_dim if getattr(self.vpr, 'embed_dim', None) else 768,), dtype=np.float32)
+        clip = np.stack(imgs, axis=0)
+        if clip.dtype != np.float32:
+            clip = clip.astype(np.float32)
+        # normalize to 0-1 range if values look like 0-255
+        if clip.max() > 1.5:
+            clip = clip / 255.0
+        if self.vpr is None:
+            self.vpr = VPRemb()
+        vec = self.vpr.encode_batch([clip])[0]  # [D]
+        return vec.astype(np.float32)
 
     def make_queries(self, clip_frames: List[np.ndarray]) -> List[Dict]:
         # select n frames evenly

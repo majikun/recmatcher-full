@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import List
 import numpy as np
 import logging
@@ -13,6 +12,7 @@ class VPRemb:
         self.device = device
         self.threads = threads
         self.force_lite = force_lite
+        self.embed_dim = 768
         self._backend = None
         self._init_backend()
 
@@ -88,20 +88,31 @@ class VPRemb:
 
     def encode_batch(self, clips: List[np.ndarray]) -> np.ndarray:
         if not clips:
-            return np.zeros((0,256), dtype=np.float32)
+            return np.zeros((0, self.embed_dim), dtype=np.float32)
+        normed = []
+        maxT = 0
+        for c in clips:
+            x = c
+            if x.ndim == 3:
+                x = x[None, ...]
+            if x.dtype != np.float32:
+                x = x.astype(np.float32)
+            if x.max() > 1.5:
+                x = x / 255.0
+            normed.append(x)
+            if x.shape[0] > maxT:
+                maxT = x.shape[0]
+        pads = []
+        for c in normed:
+            if c.shape[0] < maxT:
+                k = maxT - c.shape[0]
+                pad = np.concatenate([c, np.repeat(c[-1:], k, axis=0)], axis=0)
+            else:
+                pad = c
+            pads.append(pad)
+        arr = np.stack(pads, axis=0).astype(np.float32)
         backend, fn = self._backend
         if backend == "jax":
-            # stack to [N,T,H,W,C], pad T to the longest by repeating the last frame
-            maxT = max(c.shape[0] for c in clips)
-            pads = []
-            for c in clips:
-                if c.shape[0] < maxT:
-                    k = maxT - c.shape[0]
-                    pad = np.concatenate([c, np.repeat(c[-1:], k, axis=0)], axis=0)
-                else:
-                    pad = c
-                pads.append(pad)
-            arr = np.stack(pads, axis=0).astype(np.float32)
             try:
                 out = fn(arr)
                 return out.astype(np.float32)

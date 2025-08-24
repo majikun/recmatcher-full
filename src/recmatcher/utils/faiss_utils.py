@@ -19,9 +19,20 @@ class FaissIndex:
         self.index_path = str(index_path)
         self.normalize = normalize
         self.index = faiss.read_index(self.index_path)
+        self.d = self.index.d
 
     def search(self, vecs: np.ndarray, topk: int):
-        x = vecs.astype("float32")
+        x = np.asarray(vecs, dtype="float32")
+        if x.ndim == 1:
+            x = x[None, :]
+        # sanity check: dim must match index dim
+        if x.shape[1] != self.index.d:
+            raise ValueError(
+                f"FAISS dim mismatch: query vectors have dim={x.shape[1]}, "
+                f"but index dim={self.index.d}. This usually means the VPR model/variant "
+                f"used at query time differs from the one used to build the movie index.\n"
+                f"→ Fix: ensure the same VideoPrism backend/model is used on both sides, and the preprocess is identical."
+            )
         if self.normalize:
             faiss.normalize_L2(x)
         D, I = self.index.search(x, topk)
