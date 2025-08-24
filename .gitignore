@@ -15,3 +15,4 @@ venv/
 *.mp4
 *.mkv
 *.mov
+/out/
