@@ -1,0 +1,44 @@
+movie_index:
+  size_base: 288
+  frames_base: 12
+  win_len: 2.0
+  stride: 2.0
+  variants_base: ["letterbox", "centercrop"]
+  variants_anchor: ["h_left", "h_center", "h_right"]
+  anchor_lowcost:
+    size: 144
+    frames: 8
+    stride: 1.0
+
+query_readout:
+  tight: true
+  context: true
+  horiz_offsets: ["left", "center", "right"]
+  mirrored: true
+  frames_aggregate: "gem"      # gem|max|mean
+  n_frames: 3
+
+retrieval:
+  topk: 80
+  search_order: ["letterbox", "centercrop", "h_left", "h_right", "h_center"]
+
+rerank:
+  htile:
+    cols: 8
+    light_first: true
+    vp_tile_size: 192
+    vp_tile_frames: 6
+  dynamic:
+    window_sec: 1.5
+    metric: "corr"   # or dtw
+  weights:
+    vp: 0.45
+    tile: 0.35
+    dynamic: 0.15
+    cut: 0.05
+    prior: 0.02
+
+align:
+  monotonic: true
+  max_slope: 2.0
+  gap_penalty: 0.05

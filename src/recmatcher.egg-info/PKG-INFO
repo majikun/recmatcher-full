@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: recmatcher
+Version: 0.1.0
+Summary: Movie encoding + clip matching (letterbox/centercrop base, L/C/R anchors, two-stage retrieval with H-Tile re-rank).
+Author: You
+Requires-Python: >=3.9
+Requires-Dist: numpy>=1.24
+Requires-Dist: opencv-python-headless>=4.8
+Requires-Dist: faiss-cpu>=1.7.4
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.66
+Requires-Dist: pandas>=2.1
+Requires-Dist: scipy>=1.11

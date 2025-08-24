@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recmatcher"
+version = "0.1.0"
+description = "Movie encoding + clip matching (letterbox/centercrop base, L/C/R anchors, two-stage retrieval with H-Tile re-rank)."
+authors = [{name="You"}]
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "faiss-cpu>=1.7.4",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "pandas>=2.1",
+  "scipy>=1.11"
+]
+
+[project.scripts]
+recmatcher-index = "recmatcher.cli.index_movie:main"
+recmatcher-match = "recmatcher.cli.match_clip:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
