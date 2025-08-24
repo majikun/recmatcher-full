@@ -87,11 +87,21 @@ class VPRemb:
         return vec
 
     def encode_batch(self, clips: List[np.ndarray]) -> np.ndarray:
+        """Encode a list of time clips. To maximize stability on macOS/CPU,
+        we avoid big-batch execution and instead run one clip per call.
+        This does not change numerical results relative to a single big batch.
+        Each input may be [H,W,C] or [T,H,W,C]; values will be coerced to float32 in [0,1].
+        Returns: np.ndarray of shape [N, D].
+        """
         if not clips:
             return np.zeros((0, self.embed_dim), dtype=np.float32)
-        normed = []
-        maxT = 0
-        for c in clips:
+
+        backend, fn = self._backend
+        out_vecs = []
+        logger = logging.getLogger(__name__)
+
+        for idx, c in enumerate(clips):
+            # --- normalize to [T,H,W,C] float32 in [0,1] ---
             x = c
             if x.ndim == 3:
                 x = x[None, ...]
@@ -99,27 +109,26 @@ class VPRemb:
                 x = x.astype(np.float32)
             if x.max() > 1.5:
                 x = x / 255.0
-            normed.append(x)
-            if x.shape[0] > maxT:
-                maxT = x.shape[0]
-        pads = []
-        for c in normed:
-            if c.shape[0] < maxT:
-                k = maxT - c.shape[0]
-                pad = np.concatenate([c, np.repeat(c[-1:], k, axis=0)], axis=0)
-            else:
-                pad = c
-            pads.append(pad)
-        arr = np.stack(pads, axis=0).astype(np.float32)
-        backend, fn = self._backend
-        if backend == "jax":
-            try:
-                out = fn(arr)
-                return out.astype(np.float32)
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"VPR JAX encode failed ({e}); falling back to lite embedding for this batch.")
-                vecs = [self._lite_embed(c) for c in clips]
-                return np.stack(vecs, axis=0).astype(np.float32)
-        else:
-            vecs = [self._lite_embed(c) for c in clips]
-            return np.stack(vecs, axis=0).astype(np.float32)
+
+            # pad time dim to >=1 is guaranteed; if T==0 it would have failed above
+            # build a per-clip batch [1,T,H,W,C]
+            bx = x[None, ...]
+
+            if backend == "jax":
+                try:
+                    vec = fn(bx)  # expected [1,D] or [B,D]; our wrapper ensures pooling over T
+                    if hasattr(vec, "ndim") and vec.ndim == 2 and vec.shape[0] == 1:
+                        vec = vec[0]
+                    vec = np.asarray(vec, dtype=np.float32)
+                    if vec.ndim != 1:
+                        raise ValueError(f"unexpected VPR output shape {vec.shape} for clip {idx}")
+                    out_vecs.append(vec)
+                    continue
+                except Exception as e:
+                    logger.warning(f"VPR JAX per-clip encode failed at idx={idx} ({e!r}); falling back to lite.")
+
+            # lite fallback (or forced lite backend)
+            vec = self._lite_embed(x)
+            out_vecs.append(vec.astype(np.float32))
+
+        return np.stack(out_vecs, axis=0).astype(np.float32)

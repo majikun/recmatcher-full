@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing import List, Dict
 import numpy as np
 import cv2
+import logging
+log = logging.getLogger(__name__)
 from recmatcher.encoder.vpr_embed import VPRemb
 
 def _square_center(img, size):
@@ -99,6 +101,9 @@ class QueryReadout:
         if not clip_frames: return []
         idx = np.linspace(0, len(clip_frames)-1, max(1,self.n_frames)).astype(int)
         frames = [clip_frames[i] for i in idx]
+        log.debug(f"[qr] n_frames={len(frames)} idx={idx.tolist()}")
+        for i,f in enumerate(frames[:3]):
+            log.debug(f"[qr] frame[{i}] shape={getattr(f, 'shape', None)} dtype={getattr(f, 'dtype', None)}")
         patches = []
         if self.cfg.get("tight", True):
             patches.append(("tight", [_square_center(f, self.size) for f in frames]))
@@ -110,9 +115,22 @@ class QueryReadout:
         out = []
         for tag, imgs in patches:
             vec = self._embed_imgs(imgs)
+            # sanitize & type-normalize to avoid FAISS crashes
+            if np.isnan(vec).any() or np.isinf(vec).any():
+                log.warning(f"[qr] vec contains NaN/Inf for tag={tag}, mirrored=False; sanitizing")
+                vec = np.nan_to_num(vec, nan=0.0, posinf=1e6, neginf=-1e6)
+            vec = np.asarray(vec, dtype=np.float32)
             out.append({"tag": tag, "vec": vec, "mirrored": False})
+
             if self.cfg.get("mirrored", True):
                 imgs_m = [np.ascontiguousarray(img[:, ::-1, :]) for img in imgs]
                 vecm = self._embed_imgs(imgs_m)
+                if np.isnan(vecm).any() or np.isinf(vecm).any():
+                    log.warning(f"[qr] vec contains NaN/Inf for tag={tag}, mirrored=True; sanitizing")
+                    vecm = np.nan_to_num(vecm, nan=0.0, posinf=1e6, neginf=-1e6)
+                vecm = np.asarray(vecm, dtype=np.float32)
                 out.append({"tag": tag, "vec": vecm, "mirrored": True})
+        for q in out[:5]:
+            v = q.get('vec')
+            log.debug(f"[qr] out tag={q['tag']} mirrored={q['mirrored']} vec_shape={getattr(v, 'shape', None)}")
         return out

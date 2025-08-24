@@ -53,9 +53,10 @@ def main():
     ap.add_argument("--store", required=True, help="root dir that contains movie emb/index")
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default=None, help="override default config yaml")
+    ap.add_argument("--debug", action="store_true", help="enable debug logging")
     args = ap.parse_args()
 
-    log = setup_logging("INFO")
+    log = setup_logging("DEBUG" if args.debug else "INFO")
     cfg = load_yaml(args.config) if args.config else load_yaml(Path(__file__).resolve().parents[2] / "recmatcher/config" / "default.yaml")
     segs = read_json(args.clip_segs)
 

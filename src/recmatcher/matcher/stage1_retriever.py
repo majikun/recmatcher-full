@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict
 import numpy as np
+import logging
 from ..types import Candidate, CropVariant, TimeWindow
 from ..utils.faiss_utils import FaissIndex, IdMap
 
@@ -11,12 +12,42 @@ class Stage1Retriever:
         self.topk = topk
         self._indices = {v: (FaissIndex(p) if p else None) for v,p in index_paths.items()}
 
-    def _search_variant(self, variant: CropVariant, qvecs: np.ndarray):
-        fi = self._indices.get(variant)
-        if fi is None: 
-            return None, None, None
-        D, I = fi.search(qvecs, self.topk)
-        idmap = self.id_maps[variant]
+    def _search_variant(self, var, q):
+        """
+        旧逻辑里计算 qvecs 后直接 fi.search(...)。
+        现在在调用前做日志/清洗/类型规范，并捕获异常，把错误表面化到 Python 层。
+        """
+        fi = self._indices[var]            # FaissIndex 封装
+        qvecs = q["vecs"] if isinstance(q, dict) and "vecs" in q else q  # 兼容旧结构
+
+        # 统一成 2D [N, D]
+        qvecs = np.asarray(qvecs)
+        if qvecs.ndim == 1:
+            qvecs = qvecs[None, :]
+
+        logging.getLogger(__name__).debug(
+            f"[stage1] variant={var} qvecs shape={qvecs.shape} dtype={qvecs.dtype}"
+        )
+
+        # NaN/Inf 清洗 + float32
+        if np.isnan(qvecs).any() or np.isinf(qvecs).any():
+            logging.getLogger(__name__).warning(
+                f"[stage1] variant={var} qvecs contains NaN/Inf; sanitizing"
+            )
+            qvecs = np.nan_to_num(qvecs, nan=0.0, posinf=1e6, neginf=-1e6)
+        qvecs = qvecs.astype(np.float32, copy=False)
+
+        # 调用 Faiss，异常时打印 variant/shape 便于定位
+        try:
+            D, I = fi.search(qvecs, self.topk)
+        except Exception as e:
+            logging.getLogger(__name__).exception(
+                f"[stage1] Faiss search failed for variant={var}: {e}"
+            )
+            raise
+
+        # 返回同旧版一致的三元组
+        idmap = self.id_maps[var] if hasattr(self, "id_maps") else None
         return D, I, idmap
 
     def search(self, queries: List[dict],

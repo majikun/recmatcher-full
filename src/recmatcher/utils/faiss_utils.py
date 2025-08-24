@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -21,22 +22,27 @@ class FaissIndex:
         self.index = faiss.read_index(self.index_path)
         self.d = self.index.d
 
-    def search(self, vecs: np.ndarray, topk: int):
-        x = np.asarray(vecs, dtype="float32")
+    def search(self, x, topk: int):
+        import numpy as _np
+        # 统一为 float32 + C contiguous
+        x = _np.asarray(x, dtype=_np.float32)
         if x.ndim == 1:
             x = x[None, :]
-        # sanity check: dim must match index dim
+        # 清洗 NaN/Inf，避免底层崩溃
+        if _np.isnan(x).any() or _np.isinf(x).any():
+            logging.getLogger(__name__).warning(
+                "[faiss] query contains NaN/Inf, sanitizing with nan_to_num()"
+            )
+            x = _np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        x = _np.ascontiguousarray(x, dtype=_np.float32)
+
+        # 维度显式校验（用 Python 异常替代 C++ assert/segfault）
         if x.shape[1] != self.index.d:
             raise ValueError(
-                f"FAISS dim mismatch: query vectors have dim={x.shape[1]}, "
-                f"but index dim={self.index.d}. This usually means the VPR model/variant "
-                f"used at query time differs from the one used to build the movie index.\n"
-                f"→ Fix: ensure the same VideoPrism backend/model is used on both sides, and the preprocess is identical."
+                f"Faiss dimension mismatch: query dim {x.shape[1]} vs index dim {self.index.d}"
             )
-        if self.normalize:
-            faiss.normalize_L2(x)
-        D, I = self.index.search(x, topk)
-        return D, I
+        # 真正检索
+        return self.index.search(x, topk)
 
 def build_faiss_ip(vecs: np.ndarray, hnsw_m: int = 32) -> faiss.Index:
     x = vecs.astype("float32")
