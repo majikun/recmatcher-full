@@ -1,13 +1,14 @@
 from __future__ import annotations
+from pathlib import Path
 import cv2, numpy as np
 
 class FFMPEGFrameProvider:
     """OpenCV-based sparse frame grabber (no heavy deps)."""
-    def __init__(self):
-        pass
+    def __init__(self, movie_path: str | Path):
+        self.movie_path = Path(movie_path)
 
-    def get_frames(self, movie_path: str, t0: float, t1: float, fps: float = 3.0) -> np.ndarray:
-        cap = cv2.VideoCapture(str(movie_path))
+    def get_frames(self, t0: float, t1: float, fps: float = 3.0) -> np.ndarray:
+        cap = cv2.VideoCapture(str(self.movie_path))
         n = max(2, int((t1 - t0) * fps))
         ts = np.linspace(t0, t1, n)
         frames = []

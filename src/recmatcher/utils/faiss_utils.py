@@ -6,14 +6,53 @@ import pandas as pd
 import faiss
 
 class IdMap:
-    """CSV-based id mapping (faiss_id <-> metadata)."""
-    def __init__(self, path: str|Path):
+    """CSV-based id mapping (faiss_id <-> metadata).
+
+    Compatible APIs provided:
+      - constructor: IdMap(path)
+      - classmethods: from_csv(path), load(path), read_csv(path), from_path(path)
+      - methods: get(i), __getitem__(i), __len__(), to_dict()
+    """
+    def __init__(self, path: str | Path):
         self.path = Path(path)
         self.df = pd.read_csv(self.path)
+        # Ensure the underlying frame has a 0..N-1 index that matches FAISS row ids
+        try:
+            self.df = self.df.reset_index(drop=True)
+        except Exception:
+            pass
 
+    # --- classmethod aliases for compatibility with different callers ---
+    @classmethod
+    def from_csv(cls, path: str | Path) -> "IdMap":
+        return cls(path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "IdMap":
+        return cls(path)
+
+    @classmethod
+    def read_csv(cls, path: str | Path) -> "IdMap":
+        return cls(path)
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "IdMap":
+        return cls(path)
+
+    # --- access helpers ---------------------------------------------------
     def get(self, faiss_id: int) -> dict:
-        row = self.df.iloc[faiss_id].to_dict()
+        row = self.df.iloc[int(faiss_id)].to_dict()
         return row
+
+    def __getitem__(self, faiss_id: int) -> dict:
+        return self.get(faiss_id)
+
+    def __len__(self) -> int:
+        return int(len(self.df))
+
+    def to_dict(self) -> dict:
+        """Return a mapping {row_id: row_dict} for convenience in code paths that expect a dict-like object."""
+        return {int(i): rec for i, rec in self.df.reset_index(drop=True).to_dict(orient="index").items()}
 
 class FaissIndex:
     def __init__(self, index_path: str|Path, normalize: bool = True):

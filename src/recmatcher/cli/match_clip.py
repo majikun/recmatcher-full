@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--clip", required=True)
     ap.add_argument("--clip_segs", required=True, help="clip segs json (list of {start,end,scene_id})")
     ap.add_argument("--store", required=True, help="root dir that contains movie emb/index")
+    ap.add_argument("--movie", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default=None, help="override default config yaml")
     ap.add_argument("--skip_movie", action="store_true", help="skip loading original movie frames during rerank")
@@ -72,7 +73,7 @@ def main():
     all_results = {"segments": []}
     qr = QueryReadout(cfg["query_readout"], size=cfg["movie_index"]["size_base"], n_frames=cfg["query_readout"]["n_frames"], agg=cfg["query_readout"]["frames_aggregate"])
     rerank = Stage2Reranker(cfg["rerank"])
-    mreader = FFMPEGFrameProvider()
+    mreader = FFMPEGFrameProvider(movie_path=Path(args.movie))
     aggregator = SceneAggregator()
     aligner = SequenceAligner()
 

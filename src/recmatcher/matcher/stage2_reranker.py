@@ -47,7 +47,7 @@ class Stage2Reranker:
         results = []
         for c in cands:
             # fetch candidate frames (sparse) and average to a patch
-            frames = movie_reader.get_frames(c.tw.movie_id_path if hasattr(c.tw, "movie_id_path") else c.tw.movie_id, c.tw.t0, c.tw.t1, fps=3.0)
+            frames = movie_reader.get_frames(c.tw.t0, c.tw.t1, fps=3.0)
             if frames.ndim < 3:
                 c.score_tile = 0.0; c.score_dyn = 0.0; c.score_cut = 0.0; c.score_prior = 0.0
             else:
