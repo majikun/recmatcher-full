@@ -1,5 +1,8 @@
 README.md
 pyproject.toml
+src/recmatcher/assemble_from_match.py
+src/recmatcher/draw_windows.py
+src/recmatcher/npy2faiss.py
 src/recmatcher/types.py
 src/recmatcher.egg-info/PKG-INFO
 src/recmatcher.egg-info/SOURCES.txt
@@ -7,8 +10,12 @@ src/recmatcher.egg-info/dependency_links.txt
 src/recmatcher.egg-info/entry_points.txt
 src/recmatcher.egg-info/requires.txt
 src/recmatcher.egg-info/top_level.txt
+src/recmatcher/cli/encode_clip.py
+src/recmatcher/cli/export_one_frame.py
+src/recmatcher/cli/export_views.py
 src/recmatcher/cli/index_movie.py
 src/recmatcher/cli/match_clip.py
+src/recmatcher/cli/match_with_queries.py
 src/recmatcher/encoder/emb_store.py
 src/recmatcher/encoder/frame_sampler.py
 src/recmatcher/encoder/index_builder.py
@@ -16,6 +23,7 @@ src/recmatcher/encoder/movie_indexer.py
 src/recmatcher/encoder/preprocess.py
 src/recmatcher/encoder/vpr_embed.py
 src/recmatcher/matcher/movie_frame_provider.py
+src/recmatcher/matcher/query_io.py
 src/recmatcher/matcher/query_readout.py
 src/recmatcher/matcher/scene_aggregator.py
 src/recmatcher/matcher/sequence_aligner.py
