@@ -15,11 +15,12 @@ def load_queries(qdir: str | Path) -> List[dict]:
     items: Dict[tuple, dict] = {}
     for v in manifest.get("variants", []):
         path = qdir / "queries" / v["file"]
-        arr = np.load(path)
-        key = (v["tag"], bool(v.get("mirrored", False)))
-        items[key] = {
-            "tag": v["tag"],
-            "mirrored": bool(v.get("mirrored", False)),
+        if path.exists():
+            arr = np.load(path)
+            key = (v["tag"], bool(v.get("mirrored", False)))
+            items[key] = {
+                "tag": v["tag"],
+                "mirrored": bool(v.get("mirrored", False)),
             "vecs": arr.astype(np.float32, copy=False),
         }
     return list(items.values())

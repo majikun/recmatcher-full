@@ -467,6 +467,12 @@ def main():
             top_items = retrieve_one_seg(sid, bag, topk=int(args.topk))
             if args.nms_sec and args.nms_sec > 0:
                 top_items = _temporal_nms(top_items, win_sec=float(args.nms_sec))
+                
+        # 👉 强制用分数降序（分数相同用起止时间稳定排序，避免不同平台 JSON 顺序抖动）
+        top_items.sort(key=lambda x: (-float(x.get("score", 0.0)),
+                                    float(x.get("start", 0.0)),
+                                    float(x.get("end", 0.0))))
+        
         # Wrap matched_orig_seg and top_matches properly
         def wrap_items(items):
             wrapped = []
