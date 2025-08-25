@@ -34,6 +34,7 @@ def _scan_store(root: Path):
     return store
 
 def _read_clip_frames(clip_path: str, t0: float, t1: float, n: int=9):
+    print(f"Reading clip frames from {clip_path} [{t0:.2f},{t1:.2f}] ...")
     cap = cv2.VideoCapture(str(clip_path))
     ts = np.linspace(t0, t1, max(2,n))
     frames = []
@@ -53,6 +54,7 @@ def main():
     ap.add_argument("--store", required=True, help="root dir that contains movie emb/index")
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default=None, help="override default config yaml")
+    ap.add_argument("--skip_movie", action="store_true", help="skip loading original movie frames during rerank")
     ap.add_argument("--debug", action="store_true", help="enable debug logging")
     args = ap.parse_args()
 
@@ -96,8 +98,12 @@ def main():
                 c.tw = TimeWindow(movie_id=mid, t0=c.tw.t0, t1=c.tw.t1, scene_id=c.tw.scene_id, shot_id=c.tw.shot_id)
             merged_cands.extend(cands)
         # Re-rank using H-Tile/dynamic
-        clip_arr = np.stack([f.astype(np.float32)/255.0 for f in clip_frames], axis=0) if clip_frames else np.zeros((0,))
-        merged_cands = rerank.score(clip_arr, merged_cands, movie_reader=mreader)
+        if args.skip_movie:
+            clip_arr = np.zeros((0,))
+            merged_cands = rerank.score(clip_arr, merged_cands, movie_reader=None)
+        else:
+            clip_arr = np.stack([f.astype(np.float32)/255.0 for f in clip_frames], axis=0) if clip_frames else np.zeros((0,))
+            merged_cands = rerank.score(clip_arr, merged_cands, movie_reader=mreader)
         seg2cands[si] = merged_cands
 
     # Simple align (monotonic across segments)

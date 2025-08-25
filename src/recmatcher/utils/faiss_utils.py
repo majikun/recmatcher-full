@@ -24,11 +24,12 @@ class FaissIndex:
 
     def search(self, x, topk: int):
         import numpy as _np
-        # 统一为 float32 + C contiguous
+        import faiss as _faiss
+        # Normalize input: 2D, float32, contiguous
         x = _np.asarray(x, dtype=_np.float32)
         if x.ndim == 1:
             x = x[None, :]
-        # 清洗 NaN/Inf，避免底层崩溃
+        # Scrub NaN/Inf early to avoid C++ crashes
         if _np.isnan(x).any() or _np.isinf(x).any():
             logging.getLogger(__name__).warning(
                 "[faiss] query contains NaN/Inf, sanitizing with nan_to_num()"
@@ -36,14 +37,21 @@ class FaissIndex:
             x = _np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         x = _np.ascontiguousarray(x, dtype=_np.float32)
 
-        # 维度显式校验（用 Python 异常替代 C++ assert/segfault）
-        if x.shape[1] != self.index.d:
-            raise ValueError(
-                f"Faiss dimension mismatch: query dim {x.shape[1]} vs index dim {self.index.d}"
-            )
-        # 真正检索
-        return self.index.search(x, topk)
+        # Explicit dim check to prevent C++ side assertion/segfault
+        d = getattr(self.index, 'd', None)
+        if d is None:
+            raise RuntimeError("Faiss index not initialized or missing 'd' attribute")
+        if x.shape[1] != d:
+            raise ValueError(f"Faiss dimension mismatch: query dim {x.shape[1]} vs index dim {d}")
 
+        # Force single-thread to avoid Accelerate/OpenMP crashes on macOS/arm64
+        try:
+            _faiss.omp_set_num_threads(1)
+        except Exception:
+            pass
+
+        return self.index.search(x, topk)
+     
 def build_faiss_ip(vecs: np.ndarray, hnsw_m: int = 32) -> faiss.Index:
     x = vecs.astype("float32")
     faiss.normalize_L2(x)
