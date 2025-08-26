@@ -8,7 +8,7 @@ import copy
 from ..rerank.score_fusion import ScoreFusion, FusionParams
 from ..priors.local_state import LocalState
 from ..post.scene_consensus import SceneConsensus, SceneConsensusParams
-from ..post.scene_chain import SceneChain, SceneChainParams
+from ..post.scene_chain import SceneChain, SceneChainParams, GlobalTimeChain, GlobalChainParams
 
 def _round_ms(x: float, ms: int = 3) -> int:
     if x is None:
@@ -305,6 +305,17 @@ def main():
     ap.add_argument("--fill_max_gap", type=int, default=2)
     ap.add_argument("--fill_penalty", type=float, default=0.05)
     ap.add_argument("--scene_out", required=False, help="optional path to dump scene-level mapping/chain summary")
+    # Global cross-clip-scene time chain (optional)
+    ap.add_argument("--global_chain_enable", action="store_true", help="enable cross-clip-scene global time-chain DP")
+    ap.add_argument("--global_topk", type=int, default=3, help="candidates per clip scene for global chain")
+    ap.add_argument("--global_alpha", type=float, default=0.6, help="penalty for time going backwards (flashback)")
+    ap.add_argument("--global_beta", type=float, default=0.2, help="penalty for large forward jumps")
+    ap.add_argument("--global_gamma", type=float, default=0.2, help="penalty for movie-scene switches between adjacent clip scenes")
+    ap.add_argument("--global_allow_flashbacks", type=int, default=1, help="how many flashbacks are allowed globally")
+    ap.add_argument("--global_score_norm", choices=["minmax","softmax","none"], default="minmax", help="per-step normalization for consensus scores")
+    ap.add_argument("--global_score_w", type=float, default=1.0, help="weight for (normalized) score term in global chain")
+    ap.add_argument("--global_softmax_tau", type=float, default=0.5, help="temperature for softmax normalization (if selected)")
+    ap.add_argument("--global_stick_bonus", type=float, default=0.15, help="reward for staying in the same movie scene (reduces switchiness)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -410,6 +421,18 @@ def main():
             "fill_enable": bool(args.fill_enable),
             "fill_max_gap": int(args.fill_max_gap),
             "fill_penalty": float(args.fill_penalty),
+        },
+        "global_chain": {
+            "enable": bool(args.global_chain_enable),
+            "topk": int(args.global_topk),
+            "alpha": float(args.global_alpha),
+            "beta": float(args.global_beta),
+            "gamma": float(args.global_gamma),
+            "allow_flashbacks": int(args.global_allow_flashbacks),
+            "score_norm": str(args.global_score_norm),
+            "score_w": float(args.global_score_w),
+            "softmax_tau": float(args.global_softmax_tau),
+            "stick_bonus": float(args.global_stick_bonus),
         }
     }
     exp_writer.write_meta(run_meta)
@@ -527,6 +550,28 @@ def main():
         sc_engine = SceneConsensus(sc_params)
         ch_engine = SceneChain(ch_params)
 
+        # helper: representative time (median of starts within this clip-scene & movie-scene)
+        def _rep_time_for_scene(seg_ids, target_scene_id):
+            times = []
+            for sid in seg_ids:
+                for c in per_seg_cands.get(sid, []):
+                    if c.get("scene_id") == target_scene_id and c.get("start") is not None:
+                        try:
+                            times.append(float(c.get("start", 0.0)))
+                        except Exception:
+                            pass
+            if times:
+                times.sort()
+                mid = len(times) // 2
+                return times[mid] if len(times) % 2 == 1 else 0.5 * (times[mid-1] + times[mid])
+            seq = movie_by_scene.get(target_scene_id, [])
+            if seq:
+                return float(seq[0].get("start", 0.0))
+            return 0.0
+
+        scene_candidates_series = {}   # clip_scene_id -> [{'scene_id','score','rep_time',...}, ...]
+        selected_scene_map = {}        # clip_scene_id -> selected scene by consensus (pre-global)
+
         # build quick index of result entries by seg_id
         res_by_sid = {r["seg_id"]: r for r in results}
         # group objects for consensus: list of dict per seg {seg_id, candidates, uncertainty}
@@ -552,6 +597,21 @@ def main():
                 })
             except Exception:
                 pass
+            # collect candidates for global chain
+            selected_scene_map[clip_scene_id] = consensus.get("selected_scene")
+            cand_list = []
+            for msid, sc in (consensus.get("scores") or {}).items():
+                if msid is None:
+                    continue
+                rep_t = _rep_time_for_scene(seg_ids, msid)
+                cand_list.append({
+                    "scene_id": msid,
+                    "score": float(sc),
+                    "rep_time": float(rep_t),
+                    "coverage": int((consensus.get("coverage") or {}).get(msid, 0)),
+                    "avg_len_dev": float((consensus.get("avg_len_dev") or {}).get(msid, 0.0)),
+                })
+            scene_candidates_series[clip_scene_id] = cand_list
             selected_scene = consensus.get("selected_scene")
             if selected_scene is None:
                 continue
@@ -562,36 +622,40 @@ def main():
             fills = chain.get("fills", []); stats = chain.get("stats", {})
             # apply assignment to results (update matched_orig_seg & top_matches filtered)
             for sid in seg_ids:
+                res = res_by_sid.get(sid)
+                if res is None:
+                    continue
                 chosen = assign.get(sid)
+                # always filter top_matches to the selected movie scene to keep UI focused
+                filt = [c for c in per_seg_cands.get(sid, []) if c.get("scene_id") == selected_scene]
+                res["top_matches"] = [{
+                    "seg_id": c.get("seg_id"),
+                    "scene_seg_idx": c.get("scene_seg_idx"),
+                    "start": c.get("start"),
+                    "end": c.get("end"),
+                    "scene_id": c.get("scene_id"),
+                    "score": c.get("score"),
+                    "faiss_id": c.get("faiss_id"),
+                    "movie_id": c.get("movie_id"),
+                    "shot_id": c.get("shot_id"),
+                } for c in filt[:10]]
+
                 if chosen is not None:
-                    # backfill seg_id/idx if needed (should already be present)
                     attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
-                    res = res_by_sid.get(sid)
-                    if res is not None:
-                        res["matched_orig_seg"] = {
-                            "seg_id": chosen.get("seg_id"),
-                            "scene_seg_idx": chosen.get("scene_seg_idx"),
-                            "start": chosen.get("start"),
-                            "end": chosen.get("end"),
-                            "scene_id": chosen.get("scene_id"),
-                            "score": chosen.get("score"),
-                            "faiss_id": chosen.get("faiss_id"),
-                            "movie_id": chosen.get("movie_id"),
-                            "shot_id": chosen.get("shot_id"),
-                        }
-                        # top_matches: show top of filtered-to-scene list (up to 10)
-                        filt = [c for c in per_seg_cands.get(sid, []) if c.get("scene_id") == selected_scene]
-                        res["top_matches"] = [{
-                            "seg_id": c.get("seg_id"),
-                            "scene_seg_idx": c.get("scene_seg_idx"),
-                            "start": c.get("start"),
-                            "end": c.get("end"),
-                            "scene_id": c.get("scene_id"),
-                            "score": c.get("score"),
-                            "faiss_id": c.get("faiss_id"),
-                            "movie_id": c.get("movie_id"),
-                            "shot_id": c.get("shot_id"),
-                        } for c in filt[:10]]
+                    res["matched_orig_seg"] = {
+                        "seg_id": chosen.get("seg_id"),
+                        "scene_seg_idx": chosen.get("scene_seg_idx"),
+                        "start": chosen.get("start"),
+                        "end": chosen.get("end"),
+                        "scene_id": chosen.get("scene_id"),
+                        "score": chosen.get("score"),
+                        "faiss_id": chosen.get("faiss_id"),
+                        "movie_id": chosen.get("movie_id"),
+                        "shot_id": chosen.get("shot_id"),
+                    }
+                else:
+                    # strict chain leaves a hole at this seg; clear stale selection to avoid duplicates
+                    res["matched_orig_seg"] = None
             # explain chain
             try:
                 exp_writer.write_any({
@@ -611,6 +675,105 @@ def main():
                 "fills": fills,
                 "stats": stats,
             }
+
+        # ---- Global time-chain over clip scenes (optional) ----
+        if args.global_chain_enable:
+            # Build clip-scene order from traversal of clip_segs (deduplicate consecutive)
+            clip_scene_order = []
+            for s in clip_segs:
+                csid = s.get("scene_id")
+                if not clip_scene_order or clip_scene_order[-1] != csid:
+                    clip_scene_order.append(csid)
+
+            # Build series for DP from collected candidates
+            series = []
+            for csid in clip_scene_order:
+                cands = scene_candidates_series.get(csid, [])
+                cands = sorted(cands, key=lambda x: -x.get("score", 0.0))[:max(1, int(args.global_topk))]
+                series.append(cands)
+
+            gc_params = GlobalChainParams(
+                alpha=float(args.global_alpha),
+                beta=float(args.global_beta),
+                gamma=float(args.global_gamma),
+                allow_flashbacks=int(args.global_allow_flashbacks),
+                topk=int(args.global_topk),
+                score_w=float(args.global_score_w),
+                score_norm=str(args.global_score_norm),
+                softmax_tau=float(args.global_softmax_tau),
+                stick_bonus=float(args.global_stick_bonus),
+            )
+            gchain = GlobalTimeChain(gc_params)
+            gplan = gchain.plan(series)
+
+            # explain: global chain summary
+            try:
+                exp_writer.write_any({
+                    "type": "global_chain",
+                    "clip_scene_order": clip_scene_order,
+                    "choice_scene": gplan.get("choice_scene", []),
+                    "flashbacks": gplan.get("flashbacks", []),
+                    "cost": gplan.get("cost", 0.0),
+                })
+            except Exception:
+                pass
+
+            # Apply overrides where global plan disagrees with local consensus
+            override_map = {clip_scene_order[i]: gplan["choice_scene"][i] if i < len(gplan.get("choice_scene", [])) else None for i in range(len(clip_scene_order))}
+            res_by_sid = {r["seg_id"]: r for r in results}  # rebuild index
+            for csid in clip_scene_order:
+                chosen_scene = override_map.get(csid)
+                if chosen_scene is None or chosen_scene == selected_scene_map.get(csid):
+                    continue  # no change
+                seg_ids = clip_scene_groups.get(csid, [])
+                group_objs = []
+                for sid in seg_ids:
+                    group_objs.append({
+                        "seg_id": sid,
+                        "candidates": per_seg_cands.get(sid, []),
+                        "uncertainty": per_seg_uncert.get(sid, {}),
+                    })
+                chain = ch_engine.build(group_objs, chosen_scene, movie_by_scene)
+                assign = chain.get("assign", {}); fills = chain.get("fills", []); stats = chain.get("stats", {})
+                for sid in seg_ids:
+                    res = res_by_sid.get(sid)
+                    if res is None:
+                        continue
+                    chosen = assign.get(sid)
+                    # always filter to the globally chosen movie scene
+                    filt = [c for c in per_seg_cands.get(sid, []) if c.get("scene_id") == chosen_scene]
+                    res["top_matches"] = [{
+                        "seg_id": c.get("seg_id"),
+                        "scene_seg_idx": c.get("scene_seg_idx"),
+                        "start": c.get("start"),
+                        "end": c.get("end"),
+                        "scene_id": c.get("scene_id"),
+                        "score": c.get("score"),
+                        "faiss_id": c.get("faiss_id"),
+                        "movie_id": c.get("movie_id"),
+                        "shot_id": c.get("shot_id"),
+                    } for c in filt[:10]]
+
+                    if chosen is not None:
+                        attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
+                        res["matched_orig_seg"] = {
+                            "seg_id": chosen.get("seg_id"),
+                            "scene_seg_idx": chosen.get("scene_seg_idx"),
+                            "start": chosen.get("start"),
+                            "end": chosen.get("end"),
+                            "scene_id": chosen.get("scene_id"),
+                            "score": chosen.get("score"),
+                            "faiss_id": chosen.get("faiss_id"),
+                            "movie_id": chosen.get("movie_id"),
+                            "shot_id": chosen.get("shot_id"),
+                        }
+                    else:
+                        # clear stale result if global chain leaves a gap under strict rule
+                        res["matched_orig_seg"] = None
+                # optional: update scene_summary entry if present
+                if csid in scene_summary:
+                    scene_summary[csid]["movie_scene_id"] = chosen_scene
+                    scene_summary[csid]["stats"] = stats
 
     # write outputs
     if getattr(args, "uncert_out", None):
