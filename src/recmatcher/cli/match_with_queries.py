@@ -147,6 +147,52 @@ VARIANT_MAP = {
     "center": "h_center",  # 若电影端建了 center
 }
 
+# 变体权重与融合温度（轻量校准+投票融合用）
+VAR_WEIGHTS = {
+    "centercrop": 1.00,
+    "letterbox": 0.98,
+    "h_left": 0.97,
+    "h_center": 0.97,
+    "h_right": 0.97,
+}
+VOTE_TAU = 0.06  # softmax 温度
+MIRROR_PENALTY = 0.97  # 镜像命中小幅降权
+
+def _compute_variant_calib(retriever, seg_bags, available_variants, sample_per_var: int = 128):
+    """估计每个变体的一阶段分数尺度（中位数与IQR），用于跨变体校准。
+    返回 {variant(str): (median, iqr)}，若无样本则给出稳健默认值。
+    """
+    import numpy as _np
+    calib = {}
+    by_var_vecs = {v: [] for v in available_variants}
+    # 从 seg_bags 里抽取每个变体的若干查询向量（只取前若干个，足够估计尺度）
+    for _sid, bag in seg_bags.items():
+        for var, vec_items in bag.items():
+            if var not in by_var_vecs:
+                continue
+            for it in vec_items:
+                by_var_vecs[var].append(it["vec"])  # it 是 {"vec": ..., "mirrored": bool}
+                if len(by_var_vecs[var]) >= sample_per_var:
+                    break
+    for var, arr in by_var_vecs.items():
+        if not arr:
+            calib[var] = (0.0, 0.06)  # 缺省尺度
+            continue
+        X = _np.stack(arr).astype(_np.float32)
+        try:
+            D, I, _idm = retriever._search_variant(var, X)
+            if D.size == 0:
+                calib[var] = (0.0, 0.06)
+                continue
+            top1 = D[:, 0]
+            med = float(_np.median(top1))
+            q25, q75 = _np.percentile(top1, [25, 75])
+            iqr = float(max(q75 - q25, 1e-3))
+            calib[var] = (med, iqr)
+        except Exception:
+            calib[var] = (0.0, 0.06)
+    return calib
+
 def load_indices(store_root: Path):
     """
     在 store_root 下同时搜：
@@ -376,7 +422,7 @@ def main():
                 nrm = float(np.linalg.norm(v))
                 if nrm > 1e-6:
                     v = v / nrm
-            seg_bags[sid].setdefault(var, []).append(v)
+            seg_bags[sid].setdefault(var, []).append({"vec": v, "mirrored": bool(q.get("mirrored", False))})
 
     def _probe_variants(retriever, qitems, topk=5):
         """Return dict: {variant: top1_list} for the first few queries per variant."""
@@ -413,17 +459,38 @@ def main():
             e = m.get("t1", 0.0)
         return float(s or 0.0), float(e or 0.0)
 
+    # 基于当前查询包估计各变体分数尺度，用于跨变体校准
+    calib_tbl = _compute_variant_calib(retr, seg_bags, available_variants)
+
     def retrieve_one_seg(seg_id, bag, topk):
-        """bag: {variant(str): [vec,...]} → 融合多个变体，返回排序后的候选 list[dict]。"""
-        fuse = {}  # key=(start,end,scene_id) → score(max)
-        meta = {}  # 同 key → 任意一条元信息（含 seg_id/scene_seg_idx）
+        """bag: {variant(str): [ {"vec": ndarray, "mirrored": bool}, ... ]}
+        多变体融合策略：
+          1) 对每个变体的分数做稳健校准（减中位数/除IQR）。
+          2) 将校准后的分数进入 softmax 投票并乘以变体权重与镜像惩罚，
+             对同一 (start,end,scene) 累加票数；
+          3) 同时记录该 key 下的最大原始分数（便于保持分数尺度输出）。
+        返回 list[dict]，每个 dict 额外带 `vote` 字段作为融合得分。
+        """
+        fuse_vote = {}   # key -> 累计票数
+        fuse_meta = {}   # key -> 代表元数据（来自最大原始分数的那一条）
+        fuse_best = {}   # key -> 最大原始分数
+
         for var, vec_list in bag.items():
             if var not in available_variants:
                 continue
-            X = np.stack(vec_list).astype(np.float32)
-            D, I, _idm = retr._search_variant(var, X)
+            if not vec_list:
+                continue
+            X = np.stack([it["vec"] for it in vec_list]).astype(np.float32)
+            mir_flags = [bool(it.get("mirrored", False)) for it in vec_list]
+            try:
+                D, I, _idm = retr._search_variant(var, X)
+            except Exception:
+                continue
             rows = id_rows.get(var, [])
+            mu, iqr = calib_tbl.get(var, (0.0, 0.06))
+            w_var = VAR_WEIGHTS.get(var, 0.97)
             for r in range(I.shape[0]):
+                mir_w = (MIRROR_PENALTY if mir_flags[r] else 1.0)
                 for k in range(min(I.shape[1], topk)):
                     j = int(I[r, k])
                     if j < 0 or j >= len(rows):
@@ -432,13 +499,21 @@ def main():
                     ss, ee = _row_start_end(m)
                     key = (ss, ee, m.get("scene_id"))
                     sc = float(D[r, k])
-                    if key not in fuse or sc > fuse[key]:
-                        fuse[key] = sc
-                        meta[key] = m
-        # 排序并裁剪
+                    # 校准到近似同尺度后做 soft-vote
+                    z = (sc - mu) / max(iqr, 1e-3)
+                    vote = math.exp(z / VOTE_TAU) * w_var * mir_w
+                    fuse_vote[key] = fuse_vote.get(key, 0.0) + vote
+                    # 记录最大原始分数对应的元信息
+                    if key not in fuse_best or sc > fuse_best[key]:
+                        fuse_best[key] = sc
+                        fuse_meta[key] = m
+
+        # 组装候选，并按 vote 优先、原始分数次之排序
         items = []
-        for key, sc in fuse.items():
-            m = meta[key]
+        for key, vt in fuse_vote.items():
+            m = fuse_meta.get(key)
+            if not m:
+                continue
             ss, ee = _row_start_end(m)
             cand = {
                 "seg_id": m.get("seg_id"),
@@ -446,14 +521,16 @@ def main():
                 "start": ss,
                 "end": ee,
                 "scene_id": m.get("scene_id"),
-                "score": sc,
+                "score": float(fuse_best.get(key, 0.0)),  # 保持原分数尺度便于观测
+                "vote": float(vt),                        # 用于排序的融合得分
                 "faiss_id": m.get("faiss_id"),
                 "movie_id": m.get("movie_id"),
                 "shot_id": m.get("shot_id"),
             }
             cand = attach_seg_ids_from_meta(cand, movie_exact, movie_by_scene)
             items.append(cand)
-        items.sort(key=lambda x: x["score"], reverse=True)
+
+        items.sort(key=lambda x: (-x.get("vote", x.get("score", 0.0)), -x.get("score", 0.0)))
         return items[:topk]
 
     # === Per-seg 检索与融合，输出分段结果 ===
@@ -468,10 +545,11 @@ def main():
             if args.nms_sec and args.nms_sec > 0:
                 top_items = _temporal_nms(top_items, win_sec=float(args.nms_sec))
                 
-        # 👉 强制用分数降序（分数相同用起止时间稳定排序，避免不同平台 JSON 顺序抖动）
-        top_items.sort(key=lambda x: (-float(x.get("score", 0.0)),
-                                    float(x.get("start", 0.0)),
-                                    float(x.get("end", 0.0))))
+        # 👉 先按融合投票(vote)降序，再按原始分数与时间稳定排序
+        top_items.sort(key=lambda x: (-float(x.get("vote", x.get("score", 0.0))),
+                                      -float(x.get("score", 0.0)),
+                                      float(x.get("start", 0.0)),
+                                      float(x.get("end", 0.0))))
         
         # Wrap matched_orig_seg and top_matches properly
         def wrap_items(items):
