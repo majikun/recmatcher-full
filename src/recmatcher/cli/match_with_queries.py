@@ -292,6 +292,13 @@ def main():
     ap.add_argument("--len_dev_thr", type=float, default=0.25)
     ap.add_argument("--consensus_min", type=int, default=2)
     ap.add_argument("--uncert_out", required=False)
+    # Candidate expansion (召回增强：邻接 index 扩展)
+    ap.add_argument("--expand_enable", action="store_true", help="enable neighbor expansion around scene_seg_idx for low-recall segments")
+    ap.add_argument("--expand_kmin", type=int, default=6, help="if a segment has fewer than this many candidates after NMS, trigger expansion")
+    ap.add_argument("--expand_delta_idx", type=int, default=2, help="expand neighbors at +/-1..delta indices within the same movie scene")
+    ap.add_argument("--expand_decay", type=float, default=0.92, help="score & vote decay per index distance during expansion")
+    ap.add_argument("--expand_max_added", type=int, default=4, help="maximum number of expanded candidates to add per segment")
+    ap.add_argument("--expand_top_src", type=int, default=3, help="expand from at most this many strongest base candidates per segment")
     # Scene consensus / chain (new)
     ap.add_argument("--scene_enable", action="store_true", help="enable scene-level consensus + chain post-processing")
     ap.add_argument("--scene_vote_top_n", type=int, default=3)
@@ -421,6 +428,14 @@ def main():
         "score_source": args.score_source,
         "movie": args.movie,
         "uncertainty": {"ratio_thr": float(args.uncert_ratio_thr), "len_dev_thr": float(args.len_dev_thr), "consensus_min": int(args.consensus_min)},
+        "expand": {
+            "enable": bool(args.expand_enable),
+            "kmin": int(args.expand_kmin),
+            "delta_idx": int(args.expand_delta_idx),
+            "decay": float(args.expand_decay),
+            "max_added": int(args.expand_max_added),
+            "top_src": int(args.expand_top_src),
+        },
         "scene": {
             "enable": bool(args.scene_enable),
             "vote_top_n": int(args.scene_vote_top_n),
@@ -496,6 +511,68 @@ def main():
             for _it in explain_pre: attach_seg_ids_from_meta(_it, movie_exact, movie_by_scene)
         except Exception: pass
 
+        # --- Neighbor expansion: when recall is poor, add +/- index neighbors within the same movie scene ---
+        if bool(args.expand_enable) and len(top_items) < int(args.expand_kmin):
+            try:
+                # build quick per-scene index map from movie meta
+                # (lazy per segment because selected scenes differ per candidate)
+                added = 0
+                # only expand from up to N strongest bases that have valid scene_seg_idx
+                bases = [c for c in top_items if c.get("scene_id") is not None and c.get("scene_seg_idx") is not None]
+                bases = sorted(bases, key=lambda x: -float(x.get("vote", x.get("score", 0.0))))[:int(args.expand_top_src)]
+                # track (scene_id, scene_seg_idx) to avoid duplicates
+                seen_keys = set()
+                for c in top_items:
+                    if c.get("scene_id") is not None and c.get("scene_seg_idx") is not None:
+                        try:
+                            seen_keys.add((int(c.get("scene_id")), int(c.get("scene_seg_idx"))))
+                        except Exception:
+                            pass
+                for base in bases:
+                    sid_scene = int(base.get("scene_id"))
+                    base_idx = int(base.get("scene_seg_idx"))
+                    seq_meta = movie_by_scene.get(sid_scene, [])
+                    by_idx_meta = {int(r.get("scene_seg_idx")): r for r in seq_meta if r.get("scene_seg_idx") is not None}
+                    for di in range(1, int(args.expand_delta_idx) + 1):
+                        for idx_t in (base_idx - di, base_idx + di):
+                            if idx_t not in by_idx_meta:
+                                continue
+                            key = (sid_scene, idx_t)
+                            if key in seen_keys:
+                                continue
+                            meta = by_idx_meta[idx_t]
+                            decay = float(args.expand_decay) ** di
+                            new_item = {
+                                "seg_id": meta.get("seg_id"),
+                                "scene_seg_idx": meta.get("scene_seg_idx"),
+                                "start": meta.get("start"),
+                                "end": meta.get("end"),
+                                "scene_id": sid_scene,
+                                "score": float(base.get("score", 0.0)) * decay,
+                                "faiss_id": None,
+                                "movie_id": "movie",
+                                "shot_id": -1,
+                                # carry vote too, because we sort primarily by vote
+                                "vote": float(base.get("vote", base.get("score", 0.0))) * decay,
+                                "reason_codes": (base.get("reason_codes") or []) + [f"nb±{di}"],
+                                "source_variants": base.get("source_variants") or [],
+                                "expand_source": "neighbor",
+                            }
+                            attach_seg_ids_from_meta(new_item, movie_exact, movie_by_scene)
+                            top_items.append(new_item)
+                            seen_keys.add(key)
+                            added += 1
+                            if added >= int(args.expand_max_added):
+                                break
+                        if added >= int(args.expand_max_added):
+                            break
+                # re-rank after expansion and cap to topk window used downstream
+                top_items.sort(key=lambda x: (-float(x.get("vote", x.get("score", 0.0))), -float(x.get("score", 0.0)), float(x.get("start", 0.0)), float(x.get("end", 0.0))))
+                for _i, _it in enumerate(top_items):
+                    _it["post_nms_rank"] = int(_i + 1)
+            except Exception:
+                pass
+
         # uncertainty
         uncert = {}; 
         if len(top_items) >= 1:
@@ -525,6 +602,13 @@ def main():
                 "selected_index": 0 if top_items else None,
                 "uncertainty": uncert,
             }
+            try:
+                seg_explain["expand"] = {
+                    "enabled": bool(args.expand_enable),
+                    "after_count": len(top_items)
+                }
+            except Exception:
+                pass
             exp_writer.write_any(seg_explain)
         except Exception:
             pass
