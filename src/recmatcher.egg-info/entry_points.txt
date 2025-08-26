@@ -1,3 +1,0 @@
-[console_scripts]
-recmatcher-index = recmatcher.cli.index_movie:main
-recmatcher-match = recmatcher.cli.match_clip:main
