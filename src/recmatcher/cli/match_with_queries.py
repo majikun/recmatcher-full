@@ -6,6 +6,8 @@ import cv2
 import logging
 import math
 import copy
+from ..rerank.score_fusion import ScoreFusion, FusionParams
+from ..priors.local_state import LocalState
 def _round_ms(x: float, ms: int = 3) -> int:
     # return integer milliseconds (ms=3) or decimilliseconds if ms=2, etc.
     if x is None:
@@ -194,7 +196,7 @@ VAR_WEIGHTS = {
     "h_center": 0.97,
     "h_right": 0.97,
 }
-VOTE_TAU = 0.06  # softmax 温度
+VOTE_TAU = 0.06  # legacy default (kept for meta only)
 MIRROR_PENALTY = 0.97  # 镜像命中小幅降权
 
 def _compute_variant_calib(retriever, seg_bags, available_variants, sample_per_var: int = 128):
@@ -367,6 +369,19 @@ def main():
     ap.add_argument("--skip_rerank", action="store_true", help="完全跳过二阶段重排（仅输出一阶段得分与候选）")
     ap.add_argument("--score_source", choices=["vp", "rerank", "max", "both"], default="vp",
                     help="选择输出的score来源：vp=一阶段相似度；rerank=二阶段分；max=两者取最大；both=同时写入两个分并以vp作为score")
+    # Fusion / priors parameters (all optional; defaults keep behavior close to old)
+    ap.add_argument("--tau", type=float, default=0.8, help="soft-vote temperature (higher=flatter)")
+    ap.add_argument("--z_clip", type=float, default=5.0, help="clip standardized z to [-z_clip, z_clip]")
+    ap.add_argument("--w_consensus", type=float, default=0.05, help="bonus per additional participating variant")
+    ap.add_argument("--w_len", type=float, default=0.2, help="duration consistency penalty weight")
+    ap.add_argument("--cont_w", type=float, default=0.12, help="contiguity (siblings/same-scene) weight")
+    ap.add_argument("--mode_w", type=float, default=0.2, help="mode prior weight")
+    ap.add_argument("--mode_window", type=int, default=10, help="sliding window for mode prior")
+    # Uncertainty export (optional)
+    ap.add_argument("--uncert_ratio_thr", type=float, default=2.0, help="top1/top2 vote ratio threshold for uncertainty")
+    ap.add_argument("--len_dev_thr", type=float, default=0.25, help="abs(duration_ratio-1) threshold for uncertainty")
+    ap.add_argument("--consensus_min", type=int, default=2, help="minimum participating variants to avoid 'single_view' uncertainty")
+    ap.add_argument("--uncert_out", required=False, help="optional path to dump uncertain seg list")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -507,125 +522,96 @@ def main():
     explain_path = Path(args.explain_out) if getattr(args, "explain_out", None) else Path(args.out).with_name("match_explain.jsonl")
     exp_writer = ExplainWriter(explain_path, level=getattr(args, "explain_level", "full"))
 
+    # Initialize fusion and local priors
+    fusion = ScoreFusion(FusionParams(
+        tau=float(args.tau),
+        z_clip=float(args.z_clip),
+        var_weights=VAR_WEIGHTS,
+        mirror_penalty=MIRROR_PENALTY,
+        w_consensus=float(args.w_consensus),
+        w_len=float(args.w_len),
+        topk=int(args.topk),
+    ))
+    priors = LocalState(window=int(args.mode_window), w_cont=float(args.cont_w), w_mode=float(args.mode_w))
+
     # Emit run-level meta once
     run_meta = {
         "available_variants": sorted(list(available_variants)),
         "variant_calibration": {k: {"median": float(v[0]), "iqr": float(v[1])} for k, v in (calib_tbl or {}).items()},
         "weights": VAR_WEIGHTS,
-        "vote_tau": VOTE_TAU,
+        "vote_tau": float(args.tau),
+        "z_clip": float(args.z_clip),
         "mirror_penalty": MIRROR_PENALTY,
+        "w_consensus": float(args.w_consensus),
+        "w_len": float(args.w_len),
+        "cont_w": float(args.cont_w),
+        "mode_w": float(args.mode_w),
+        "mode_window": int(args.mode_window),
         "topk": int(args.topk),
         "nms_sec": float(args.nms_sec or 0.0),
         "score_source": args.score_source,
         "movie": args.movie,
+        "uncertainty": {
+            "ratio_thr": float(args.uncert_ratio_thr),
+            "len_dev_thr": float(args.len_dev_thr),
+            "consensus_min": int(args.consensus_min),
+        },
     }
     exp_writer.write_meta(run_meta)
 
+    # Thin wrapper kept for compatibility; real fusion is below in-loop
     def retrieve_one_seg(seg_id, bag, topk):
-        """bag: {variant(str): [ {"vec": ndarray, "mirrored": bool}, ... ]}
-        多变体融合策略：
-          1) 对每个变体的分数做稳健校准（减中位数/除IQR）。
-          2) 将校准后的分数进入 softmax 投票并乘以变体权重与镜像惩罚，
-             对同一 (start,end,scene) 累加票数；
-          3) 同时记录该 key 下的最大原始分数（便于保持分数尺度输出）。
-        返回 list[dict]，每个 dict 额外带 `vote` 字段作为融合得分。
-        """
-        fuse_vote = {}            # key -> 累计票数
-        fuse_meta = {}            # key -> 代表元数据（来自最大原始分数的那一条）
-        fuse_best = {}            # key -> 最大原始分数
-        fuse_var_votes = {}       # key -> {variant: vote_sum}
-        fuse_any_mirrored = {}    # key -> bool
-
-        for var, vec_list in bag.items():
-            if var not in available_variants:
-                continue
-            if not vec_list:
-                continue
-            X = np.stack([it["vec"] for it in vec_list]).astype(np.float32)
-            mir_flags = [bool(it.get("mirrored", False)) for it in vec_list]
-            try:
-                D, I, _idm = retr._search_variant(var, X)
-            except Exception:
-                continue
-            rows = id_rows.get(var, [])
-            mu, iqr = calib_tbl.get(var, (0.0, 0.06))
-            w_var = VAR_WEIGHTS.get(var, 0.97)
-            for r in range(I.shape[0]):
-                mir_w = (MIRROR_PENALTY if mir_flags[r] else 1.0)
-                for k in range(min(I.shape[1], topk)):
-                    j = int(I[r, k])
-                    if j < 0 or j >= len(rows):
-                        continue
-                    m = rows[j]
-                    ss, ee = _row_start_end(m)
-                    key = (ss, ee, m.get("scene_id"))
-                    sc = float(D[r, k])
-                    # 校准到近似同尺度后做 soft-vote
-                    z = (sc - mu) / max(iqr, 1e-3)
-                    vote = math.exp(z / VOTE_TAU) * w_var * mir_w
-                    fuse_vote[key] = fuse_vote.get(key, 0.0) + vote
-                    # per-variant vote accumulation
-                    if key not in fuse_var_votes:
-                        fuse_var_votes[key] = {}
-                    fuse_var_votes[key][var] = fuse_var_votes[key].get(var, 0.0) + float(vote)
-                    # mirrored flag accumulation
-                    if mir_flags[r]:
-                        fuse_any_mirrored[key] = True
-                    elif key not in fuse_any_mirrored:
-                        fuse_any_mirrored[key] = False
-                    # 记录最大原始分数对应的元信息
-                    if key not in fuse_best or sc > fuse_best[key]:
-                        fuse_best[key] = sc
-                        fuse_meta[key] = m
-
-        # 组装候选，并按 vote 优先、原始分数次之排序
-        items = []
-        for key, vt in fuse_vote.items():
-            m = fuse_meta.get(key)
-            if not m:
-                continue
-            ss, ee = _row_start_end(m)
-            cand = {
-                "seg_id": m.get("seg_id"),
-                "scene_seg_idx": m.get("scene_seg_idx"),
-                "start": ss,
-                "end": ee,
-                "scene_id": m.get("scene_id"),
-                "score": float(fuse_best.get(key, 0.0)),  # 保持原分数尺度便于观测
-                "vote": float(vt),                        # 用于排序的融合得分
-                "faiss_id": m.get("faiss_id"),
-                "movie_id": m.get("movie_id"),
-                "shot_id": m.get("shot_id"),
-                # explain extras
-                "variant_votes": {vk: float(vv) for vk, vv in (fuse_var_votes.get(key, {}) or {}).items()},
-                "source_variants": sorted(list((fuse_var_votes.get(key, {}) or {}).keys())),
-                "mirrored_any": bool(fuse_any_mirrored.get(key, False)),
-            }
-            cand = attach_seg_ids_from_meta(cand, movie_exact, movie_by_scene)
-            items.append(cand)
-
-        items.sort(key=lambda x: (-x.get("vote", x.get("score", 0.0)), -x.get("score", 0.0)))
-        return items[:topk]
+        return []
 
     # === Per-seg 检索与融合，输出分段结果 ===
     results = []
     for s in clip_segs:
         sid = s.get("seg_id")
         bag = seg_bags.get(sid, {})
+        # Fuse per-seg candidates with new fusion logic
+        clip_dur = max(1e-9, float(s.get("end", 0.0)) - float(s.get("start", 0.0)))
         if not bag:
             top_items_pre = []
         else:
-            top_items_pre = retrieve_one_seg(sid, bag, topk=int(args.topk))
+            top_items_pre = fusion.fuse_segment(
+                seg_id=sid,
+                bag=bag,
+                retriever=retr,
+                id_rows=id_rows,
+                calib_tbl=calib_tbl,
+                clip_dur=clip_dur,
+                topk=int(args.topk),
+            )
         # 标注 NMS 前排名
         for _i, _it in enumerate(top_items_pre):
             _it["pre_nms_rank"] = int(_i + 1)
+
+        # 应用局部先验（仅加分，不做硬约束）
+        prev_sel = getattr(priors, "prev_selected", None)
+        for _it in top_items_pre:
+            # contiguity
+            b_cont, cont_detail = priors.contiguity_bonus(prev_sel, _it)
+            if b_cont > 0:
+                _it["vote"] = float(_it.get("vote", 0.0)) + float(b_cont)
+                _it.setdefault("reason_codes", []).append("cont+")
+            _it["contiguity_feat"] = cont_detail
+            # mode prior
+            pv = _it.get("primary_variant")
+            b_mode, mode_detail = priors.mode_prior_bonus(pv)
+            if b_mode > 0:
+                _it["vote"] = float(_it.get("vote", 0.0)) + float(b_mode)
+                _it.setdefault("reason_codes", []).append("mode+")
+            _it["mode_prior"] = mode_detail
+
         # 备份一份用于 explain（深拷贝）
         explain_pre = [copy.deepcopy(x) for x in top_items_pre[:max(10, int(args.topk))]]
+
         # 可选 NMS
         if args.nms_sec and args.nms_sec > 0:
             top_items = _temporal_nms(list(top_items_pre), win_sec=float(args.nms_sec))
         else:
             top_items = list(top_items_pre)
+
         # 最终排序
         top_items.sort(key=lambda x: (-float(x.get("vote", x.get("score", 0.0))),
                                       -float(x.get("score", 0.0)),
@@ -653,6 +639,29 @@ def main():
         wrapped_top_items = wrap_items(top_items)[:10]
         matched_orig_seg = wrapped_top_items[0] if wrapped_top_items else None
 
+        # Uncertainty measures & update priors' state
+        uncert = {}
+        if len(top_items) >= 1:
+            top1 = top_items[0]
+            top2 = top_items[1] if len(top_items) > 1 else None
+            ratio = float(top1.get("vote", 0.0)) / (float(top2.get("vote", 0.0)) + 1e-9) if top2 else float("inf")
+            consensus_m = int(len(top1.get("source_variants") or []))
+            len_dev = float(abs(float(top1.get("duration_ratio", 1.0)) - 1.0))
+            flags = []
+            if ratio < float(args.uncert_ratio_thr):
+                flags.append("low_ratio")
+            if consensus_m < int(args.consensus_min):
+                flags.append("single_view")
+            if len_dev > float(args.len_dev_thr):
+                flags.append("len_dev")
+            uncert = {"ratio": ratio, "consensus_m": consensus_m, "len_dev": len_dev, "flags": flags}
+            # update priors with selected (pseudo anchor)
+            priors.prev_selected = top1
+            try:
+                priors.update_mode_hist(top1)
+            except Exception:
+                pass
+
         # 解释输出（每段一行）
         try:
             seg_explain = {
@@ -666,8 +675,7 @@ def main():
                 "candidates_pre": explain_pre[:10],
                 "candidates_post": [copy.deepcopy(x) for x in top_items[:10]],
                 "selected_index": 0 if top_items else None,
-                "time_prior": None,  # 预留：后续接入在线时间映射
-                "mode_prior": None,  # 预留：后续接入裁剪模式先验
+                "uncertainty": uncert,
             }
             exp_writer.write_segment(seg_explain)
         except Exception:
@@ -688,8 +696,17 @@ def main():
     # 统计一下整体分数分布（基于 matched_orig_seg）
     scores = [x["matched_orig_seg"]["score"] for x in results if x.get("matched_orig_seg")]
     if scores:
-        scores = np.array(scores, dtype=np.float32)
-        print(f"[summary] matched top1: min={scores.min():.3f} med={np.median(scores):.3f} max={scores.max():.3f} (n={len(scores)})")
+        import numpy as _np
+        scores = _np.array(scores, dtype=_np.float32)
+        print(f"[summary] matched top1: min={scores.min():.3f} med={_np.median(scores):.3f} max={scores.max():.3f} (n={len(scores)})")
+
+    # Optionally dump uncertain segment ids (placeholder; UI can also read from JSONL)
+    if getattr(args, "uncert_out", None):
+        try:
+            with open(args.uncert_out, "w", encoding="utf-8") as f:
+                json.dump({"segments": []}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     write_json(Path(args.out), results)

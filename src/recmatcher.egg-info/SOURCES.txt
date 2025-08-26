@@ -1,8 +1,5 @@
 README.md
 pyproject.toml
-src/recmatcher/assemble_from_match.py
-src/recmatcher/draw_windows.py
-src/recmatcher/npy2faiss.py
 src/recmatcher/types.py
 src/recmatcher.egg-info/PKG-INFO
 src/recmatcher.egg-info/SOURCES.txt
@@ -29,6 +26,13 @@ src/recmatcher/matcher/scene_aggregator.py
 src/recmatcher/matcher/sequence_aligner.py
 src/recmatcher/matcher/stage1_retriever.py
 src/recmatcher/matcher/stage2_reranker.py
+src/recmatcher/priors/__init__.py
+src/recmatcher/priors/local_state.py
+src/recmatcher/rerank/__init__.py
+src/recmatcher/rerank/score_fusion.py
+src/recmatcher/tools/assemble_from_match.py
+src/recmatcher/tools/draw_windows.py
+src/recmatcher/tools/npy2faiss.py
 src/recmatcher/utils/faiss_utils.py
 src/recmatcher/utils/io.py
 src/recmatcher/utils/logging.py
