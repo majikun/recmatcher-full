@@ -70,7 +70,7 @@ class MovieIndexer:
     def build_base(self, movie_path: str, segs_path: str, size:int=288, win_len:float=2.0, stride:float=2.0) -> None:
         movie_path = Path(movie_path); segs = read_json(segs_path)
         movie_id = movie_path.stem
-        out_dir = ensure_dir(self.out_root / movie_id)
+        out_dir = ensure_dir(self.out_root / "movie")
         write_json(out_dir / "meta" / "segs.json", segs)
         cap = cv2.VideoCapture(str(movie_path))
         tws = FrameSampler(win_len, stride).make_windows(movie_id, segs)
@@ -89,7 +89,7 @@ class MovieIndexer:
                                  only_time_ranges: Optional[List[Tuple[float,float]]] = None) -> None:
         movie_path = Path(movie_path); segs = read_json(segs_path)
         movie_id = movie_path.stem
-        out_dir = ensure_dir(self.out_root / movie_id)
+        out_dir = ensure_dir(self.out_root / "movie")
         cap = cv2.VideoCapture(str(movie_path))
         tws_all = FrameSampler(win_len, stride).make_windows(movie_id, segs)
         if only_time_ranges:
