@@ -619,7 +619,13 @@ def main():
                                       float(x.get("end", 0.0))))
         for _i, _it in enumerate(top_items):
             _it["post_nms_rank"] = int(_i + 1)
-
+        try:
+            for _it in top_items:
+                attach_seg_ids_from_meta(_it, movie_exact, movie_by_scene)
+            for _it in explain_pre:
+                attach_seg_ids_from_meta(_it, movie_exact, movie_by_scene)
+        except Exception:
+            pass
         # Wrap matched_orig_seg and top_matches properly
         def wrap_items(items):
             wrapped = []
