@@ -316,6 +316,18 @@ def main():
     ap.add_argument("--global_score_w", type=float, default=1.0, help="weight for (normalized) score term in global chain")
     ap.add_argument("--global_softmax_tau", type=float, default=0.5, help="temperature for softmax normalization (if selected)")
     ap.add_argument("--global_stick_bonus", type=float, default=0.15, help="reward for staying in the same movie scene (reduces switchiness)")
+    # Global chain v2 controls: flip-flop penalty, cooldown repeat, anchors + corridor, smoothing
+    ap.add_argument("--global_flipflop_penalty", type=float, default=0.6, help="penalty for ABA flip-flop (A->B->A)")
+    ap.add_argument("--global_min_run", type=int, default=2, help="post-smoothing: minimum contiguous run length")
+    ap.add_argument("--global_min_run_score_margin", type=float, default=0.05, help="only merge A B A when B is weaker than neighbors by this margin")
+    ap.add_argument("--global_repeat_cooldown_steps", type=int, default=3, help="penalize revisits within this many steps (short-gap repeats)")
+    ap.add_argument("--global_repeat_cooldown_penalty", type=float, default=0.4, help="base penalty for a short-gap revisit (decays with distance)")
+    ap.add_argument("--global_anchor_enable", type=int, default=1, help="enable anchor+corridor (1=on,0=off)")
+    ap.add_argument("--global_anchor_ratio_thr", type=float, default=1.8, help="top1/top2 ratio to mark an anchor")
+    ap.add_argument("--global_anchor_margin_thr", type=float, default=0.15, help="absolute normalized margin to mark an anchor")
+    ap.add_argument("--global_anchor_min_coverage", type=int, default=2, help="minimum coverage to mark an anchor")
+    ap.add_argument("--global_anchor_span", type=int, default=1, help="affect neighbors within ±span steps")
+    ap.add_argument("--global_anchor_corridor_sec", type=float, default=20.0, help="keep neighbors' candidates within ±seconds of anchor rep_time")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -432,7 +444,19 @@ def main():
             "score_norm": str(args.global_score_norm),
             "score_w": float(args.global_score_w),
             "softmax_tau": float(args.global_softmax_tau),
-            "stick_bonus": float(args.global_stick_bonus),
+            "stick_bonus": float(args.global_stick_bonus)
+            ,
+            "flipflop_penalty": float(args.global_flipflop_penalty),
+            "min_run": int(args.global_min_run),
+            "min_run_score_margin": float(args.global_min_run_score_margin),
+            "repeat_cooldown_steps": int(args.global_repeat_cooldown_steps),
+            "repeat_cooldown_penalty": float(args.global_repeat_cooldown_penalty),
+            "anchor_enable": int(args.global_anchor_enable),
+            "anchor_ratio_thr": float(args.global_anchor_ratio_thr),
+            "anchor_margin_thr": float(args.global_anchor_margin_thr),
+            "anchor_min_coverage": int(args.global_anchor_min_coverage),
+            "anchor_span": int(args.global_anchor_span),
+            "anchor_corridor_sec": float(args.global_anchor_corridor_sec)
         }
     }
     exp_writer.write_meta(run_meta)
@@ -620,12 +644,18 @@ def main():
             chain = ch_engine.build(group_objs, selected_scene, movie_by_scene)
             assign = chain.get("assign", {})
             fills = chain.get("fills", []); stats = chain.get("stats", {})
+
+            # prepare a queue of fills for this clip scene (apply to gaps in order)
+            fill_queue = sorted((fills or []), key=lambda f: int(f.get("scene_seg_idx", 0)))
+            used_fills = set()
+
             # apply assignment to results (update matched_orig_seg & top_matches filtered)
             for sid in seg_ids:
                 res = res_by_sid.get(sid)
                 if res is None:
                     continue
                 chosen = assign.get(sid)
+
                 # always filter top_matches to the selected movie scene to keep UI focused
                 filt = [c for c in per_seg_cands.get(sid, []) if c.get("scene_id") == selected_scene]
                 res["top_matches"] = [{
@@ -640,6 +670,59 @@ def main():
                     "shot_id": c.get("shot_id"),
                 } for c in filt[:10]]
 
+                # If chain didn't pick a candidate, try to apply a fill by default
+                if chosen is None and bool(args.fill_enable) and fill_queue:
+                    # consume next unused fill (by scene_seg_idx order)
+                    fill_obj = None
+                    for f in fill_queue:
+                        key = int(f.get("scene_seg_idx", -1))
+                        if key not in used_fills:
+                            fill_obj = f
+                            used_fills.add(key)
+                            break
+                    if fill_obj is not None:
+                        idx_need = int(fill_obj.get("scene_seg_idx"))
+                        # try to find a real candidate in this seg with the same scene_seg_idx
+                        cand_match = None
+                        for c in filt:
+                            if c.get("scene_seg_idx") is not None and int(c.get("scene_seg_idx")) == idx_need:
+                                if cand_match is None or float(c.get("score", 0.0)) > float(cand_match.get("score", 0.0)):
+                                    cand_match = c
+                        if cand_match is not None:
+                            chosen = dict(cand_match)
+                            chosen["is_fill"] = True
+                            chosen["fill_source"] = "candidate"
+                            chosen["fill_penalty"] = float(fill_obj.get("penalty", args.fill_penalty))
+                        else:
+                            # synthesize from movie meta if no exact candidate present
+                            chosen = {
+                                "seg_id": None,
+                                "scene_seg_idx": idx_need,
+                                "start": float(fill_obj.get("start", 0.0)),
+                                "end": float(fill_obj.get("end", 0.0)),
+                                "scene_id": int(fill_obj.get("scene_id")),
+                                "score": 0.0,
+                                "faiss_id": None,
+                                "movie_id": "movie",
+                                "shot_id": -1,
+                                "is_fill": True,
+                                "fill_source": "synthetic",
+                                "fill_penalty": float(fill_obj.get("penalty", args.fill_penalty)),
+                            }
+                            attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
+                        # explain the applied fill
+                        try:
+                            exp_writer.write_any({
+                                "type": "fill_apply",
+                                "clip_scene_id": clip_scene_id,
+                                "seg_id": sid,
+                                "scene_seg_idx": int(chosen.get("scene_seg_idx")),
+                                "source": chosen.get("fill_source"),
+                                "penalty": float(chosen.get("fill_penalty", 0.0)),
+                            })
+                        except Exception:
+                            pass
+
                 if chosen is not None:
                     attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
                     res["matched_orig_seg"] = {
@@ -652,9 +735,12 @@ def main():
                         "faiss_id": chosen.get("faiss_id"),
                         "movie_id": chosen.get("movie_id"),
                         "shot_id": chosen.get("shot_id"),
+                        "is_fill": bool(chosen.get("is_fill", False)),
+                        "fill_source": chosen.get("fill_source"),
+                        "fill_penalty": chosen.get("fill_penalty"),
                     }
                 else:
-                    # strict chain leaves a hole at this seg; clear stale selection to avoid duplicates
+                    # leave a hole (no stale result)
                     res["matched_orig_seg"] = None
             # explain chain
             try:
@@ -675,6 +761,130 @@ def main():
                 "fills": fills,
                 "stats": stats,
             }
+
+            # --- Enforce contiguous strictly-increasing mapping of length=len(seg_ids) ---
+            # If the current assignments are not contiguous increasing (e.g., 1823,1824,1826,1828,1825...),
+            # rebuild a consecutive window [start, start+L-1] maximizing coverage, and fill missing with synthetic items.
+            try:
+                # collect current assigned indices
+                cur_idx_seq = []
+                for sid in seg_ids:
+                    cur = res_by_sid.get(sid, {}).get("matched_orig_seg")
+                    cur_idx_seq.append(cur.get("scene_seg_idx") if cur else None)
+
+                def _is_contiguous(seq):
+                    if any(v is None for v in seq):
+                        return False
+                    for k in range(1, len(seq)):
+                        if int(seq[k]) != int(seq[k-1]) + 1:
+                            return False
+                    return True
+
+                if selected_scene is not None and not _is_contiguous(cur_idx_seq):
+                    L = len(seg_ids)
+                    # per seg: best candidate per target idx in this selected scene
+                    cand_by_sid_idx = {}
+                    all_idx = set()
+                    for sid in seg_ids:
+                        for c in per_seg_cands.get(sid, []):
+                            if c.get("scene_id") != selected_scene:
+                                continue
+                            idx = c.get("scene_seg_idx")
+                            if idx is None:
+                                continue
+                            idx = int(idx)
+                            d = cand_by_sid_idx.setdefault(sid, {})
+                            prev = d.get(idx)
+                            if prev is None or float(c.get("score", 0.0)) > float(prev.get("score", 0.0)):
+                                d[idx] = c
+                            all_idx.add(idx)
+                    seq_meta = movie_by_scene.get(selected_scene, [])
+                    by_idx_meta = {int(r.get("scene_seg_idx")): r for r in seq_meta if r.get("scene_seg_idx") is not None}
+
+                    if all_idx:
+                        min_idx = min(all_idx)
+                        max_idx = max(all_idx)
+                        start_min = min_idx - int(args.fill_max_gap)
+                        start_max = max_idx - (L - 1) + int(args.fill_max_gap)
+                        best_start, best_score = None, -1e18
+                        for start in range(start_min, start_max + 1):
+                            tot = 0.0
+                            for p, sid in enumerate(seg_ids):
+                                idx_t = start + p
+                                cand = cand_by_sid_idx.get(sid, {}).get(idx_t)
+                                if cand:
+                                    tot += float(cand.get("score", 0.0))
+                                else:
+                                    tot -= float(args.fill_penalty)
+                            if tot > best_score:
+                                best_score, best_start = tot, start
+                        if best_start is not None:
+                            # apply rebuilt contiguous mapping
+                            new_assign = {}
+                            for p, sid in enumerate(seg_ids):
+                                idx_t = best_start + p
+                                cand = cand_by_sid_idx.get(sid, {}).get(idx_t)
+                                if cand is not None:
+                                    chosen = dict(cand)
+                                    chosen["is_fill"] = False
+                                    chosen["fill_source"] = None
+                                    chosen["fill_penalty"] = None
+                                else:
+                                    meta = by_idx_meta.get(idx_t)
+                                    if meta is None:
+                                        # if even meta is missing, skip replacing this sid
+                                        continue
+                                    chosen = {
+                                        "seg_id": meta.get("seg_id"),
+                                        "scene_seg_idx": meta.get("scene_seg_idx"),
+                                        "start": meta.get("start"),
+                                        "end": meta.get("end"),
+                                        "scene_id": meta.get("scene_id"),
+                                        "score": 0.0,
+                                        "faiss_id": None,
+                                        "movie_id": "movie",
+                                        "shot_id": -1,
+                                        "is_fill": True,
+                                        "fill_source": "synthetic",
+                                        "fill_penalty": float(args.fill_penalty),
+                                    }
+                                attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
+                                res = res_by_sid.get(sid)
+                                if res is not None:
+                                    res["matched_orig_seg"] = {
+                                        "seg_id": chosen.get("seg_id"),
+                                        "scene_seg_idx": chosen.get("scene_seg_idx"),
+                                        "start": chosen.get("start"),
+                                        "end": chosen.get("end"),
+                                        "scene_id": chosen.get("scene_id"),
+                                        "score": chosen.get("score"),
+                                        "faiss_id": chosen.get("faiss_id"),
+                                        "movie_id": chosen.get("movie_id"),
+                                        "shot_id": chosen.get("shot_id"),
+                                        "is_fill": bool(chosen.get("is_fill", False)),
+                                        "fill_source": chosen.get("fill_source"),
+                                        "fill_penalty": chosen.get("fill_penalty"),
+                                    }
+                                    # keep top_matches already filtered above
+                                    new_assign[sid] = res["matched_orig_seg"]
+                            # update scene_summary assign indexes to reflect rebuild
+                            try:
+                                scene_summary[int(clip_scene_id)]["assign"] = {int(s): (int(new_assign[s]["scene_seg_idx"]) if s in new_assign and new_assign[s].get("scene_seg_idx") is not None else None) for s in seg_ids}
+                            except Exception:
+                                pass
+                            # explain
+                            try:
+                                exp_writer.write_any({
+                                    "type": "scene_consecutive_rebuild",
+                                    "clip_scene_id": clip_scene_id,
+                                    "movie_scene_id": selected_scene,
+                                    "start_idx": int(best_start),
+                                    "length": int(L),
+                                })
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
         # ---- Global time-chain over clip scenes (optional) ----
         if args.global_chain_enable:
@@ -702,6 +912,17 @@ def main():
                 score_norm=str(args.global_score_norm),
                 softmax_tau=float(args.global_softmax_tau),
                 stick_bonus=float(args.global_stick_bonus),
+                flipflop_penalty=float(args.global_flipflop_penalty),
+                min_run=int(args.global_min_run),
+                min_run_score_margin=float(args.global_min_run_score_margin),
+                repeat_cooldown_steps=int(args.global_repeat_cooldown_steps),
+                repeat_cooldown_penalty=float(args.global_repeat_cooldown_penalty),
+                anchor_enable=bool(int(args.global_anchor_enable)),
+                anchor_ratio_thr=float(args.global_anchor_ratio_thr),
+                anchor_margin_thr=float(args.global_anchor_margin_thr),
+                anchor_min_coverage=int(args.global_anchor_min_coverage),
+                anchor_span=int(args.global_anchor_span),
+                anchor_corridor_sec=float(args.global_anchor_corridor_sec),
             )
             gchain = GlobalTimeChain(gc_params)
             gplan = gchain.plan(series)
@@ -735,11 +956,16 @@ def main():
                     })
                 chain = ch_engine.build(group_objs, chosen_scene, movie_by_scene)
                 assign = chain.get("assign", {}); fills = chain.get("fills", []); stats = chain.get("stats", {})
+                # prepare fills queue for this clip scene
+                fill_queue = sorted((fills or []), key=lambda f: int(f.get("scene_seg_idx", 0)))
+                used_fills = set()
+
                 for sid in seg_ids:
                     res = res_by_sid.get(sid)
                     if res is None:
                         continue
                     chosen = assign.get(sid)
+
                     # always filter to the globally chosen movie scene
                     filt = [c for c in per_seg_cands.get(sid, []) if c.get("scene_id") == chosen_scene]
                     res["top_matches"] = [{
@@ -754,6 +980,54 @@ def main():
                         "shot_id": c.get("shot_id"),
                     } for c in filt[:10]]
 
+                    if chosen is None and bool(args.fill_enable) and fill_queue:
+                        fill_obj = None
+                        for f in fill_queue:
+                            key = int(f.get("scene_seg_idx", -1))
+                            if key not in used_fills:
+                                fill_obj = f
+                                used_fills.add(key)
+                                break
+                        if fill_obj is not None:
+                            idx_need = int(fill_obj.get("scene_seg_idx"))
+                            cand_match = None
+                            for c in filt:
+                                if c.get("scene_seg_idx") is not None and int(c.get("scene_seg_idx")) == idx_need:
+                                    if cand_match is None or float(c.get("score", 0.0)) > float(cand_match.get("score", 0.0)):
+                                        cand_match = c
+                            if cand_match is not None:
+                                chosen = dict(cand_match)
+                                chosen["is_fill"] = True
+                                chosen["fill_source"] = "candidate"
+                                chosen["fill_penalty"] = float(fill_obj.get("penalty", args.fill_penalty))
+                            else:
+                                chosen = {
+                                    "seg_id": None,
+                                    "scene_seg_idx": idx_need,
+                                    "start": float(fill_obj.get("start", 0.0)),
+                                    "end": float(fill_obj.get("end", 0.0)),
+                                    "scene_id": int(fill_obj.get("scene_id")),
+                                    "score": 0.0,
+                                    "faiss_id": None,
+                                    "movie_id": "movie",
+                                    "shot_id": -1,
+                                    "is_fill": True,
+                                    "fill_source": "synthetic",
+                                    "fill_penalty": float(fill_obj.get("penalty", args.fill_penalty)),
+                                }
+                                attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
+                            try:
+                                exp_writer.write_any({
+                                    "type": "fill_apply",
+                                    "clip_scene_id": csid,
+                                    "seg_id": sid,
+                                    "scene_seg_idx": int(chosen.get("scene_seg_idx")),
+                                    "source": chosen.get("fill_source"),
+                                    "penalty": float(chosen.get("fill_penalty", 0.0)),
+                                })
+                            except Exception:
+                                pass
+
                     if chosen is not None:
                         attach_seg_ids_from_meta(chosen, movie_exact, movie_by_scene)
                         res["matched_orig_seg"] = {
@@ -766,9 +1040,11 @@ def main():
                             "faiss_id": chosen.get("faiss_id"),
                             "movie_id": chosen.get("movie_id"),
                             "shot_id": chosen.get("shot_id"),
+                            "is_fill": bool(chosen.get("is_fill", False)),
+                            "fill_source": chosen.get("fill_source"),
+                            "fill_penalty": chosen.get("fill_penalty"),
                         }
                     else:
-                        # clear stale result if global chain leaves a gap under strict rule
                         res["matched_orig_seg"] = None
                 # optional: update scene_summary entry if present
                 if csid in scene_summary:

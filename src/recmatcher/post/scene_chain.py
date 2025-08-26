@@ -8,7 +8,7 @@ class SceneChainParams:
     len_w: float = 0.3                # reward closeness of duration
     jump_penalty: float = 0.2         # penalty per index jump > 1
     strict_increase: bool = True      # **NEW**: enforce strictly increasing scene_seg_idx (no repeats)
-    fill_enable: bool = False
+    fill_enable: bool = True
     fill_max_gap: int = 2             # max size of hole to fill (in scene_seg_idx units)
     fill_penalty: float = 0.05        # small penalty for fills (confidence lower)
 
@@ -134,6 +134,20 @@ class GlobalChainParams:
     score_norm: str = "minmax"     # "minmax" | "softmax" | "none"
     softmax_tau: float = 0.5       # temperature for softmax normalization
     stick_bonus: float = 0.15      # reward (negative penalty) for staying in the same movie scene
+    # New: cross-scene repeat control & smoothing
+    flipflop_penalty: float = 0.6  # penalty for ABA flip-flop: A->B->A
+    min_run: int = 2               # enforce minimum contiguous run length via light post-smoothing
+    min_run_score_margin: float = 0.05  # margin: only merge A B A -> A if B is weaker than neighbors by this
+    # New: repeat-with-cooldown (penalize short-gap revisits; allow long-gap reprises)
+    repeat_cooldown_steps: int = 3           # consider revisits within this many steps (>=2)
+    repeat_cooldown_penalty: float = 0.4     # base penalty for a revisit; decays with distance
+    # New: anchors + corridor
+    anchor_enable: bool = True
+    anchor_ratio_thr: float = 1.8            # top1/top2 ratio to mark an anchor
+    anchor_margin_thr: float = 0.15          # or absolute (norm) margin to mark an anchor
+    anchor_min_coverage: int = 2             # or coverage >= this
+    anchor_span: int = 1                      # affect neighbors within ±span steps
+    anchor_corridor_sec: float = 20.0         # keep candidates near the anchor's rep_time (± seconds)
 
 class GlobalTimeChain:
     """
@@ -222,6 +236,57 @@ class GlobalTimeChain:
                     c["score_norm"] = float(c.get("score", 0.0))
 
         T = len(S)
+
+        # ---- Anchors + corridor filtering (lock strong steps; restrict neighbors by time window) ----
+        if self.p.anchor_enable and T > 0:
+            anchor_idx: Dict[int, int] = {}
+            allowed_ranges: List[Optional[Tuple[float, float]]] = [None] * T
+            # decide anchors using normalized scores (already attached)
+            for t in range(T):
+                if not S[t]:
+                    continue
+                # sort by normalized score descending, keep original indices
+                scored = sorted([(k, float(c.get("score_norm", c.get("score", 0.0)))) for k, c in enumerate(S[t])],
+                                key=lambda x: -x[1])
+                k1, s1 = scored[0]
+                s2 = scored[1][1] if len(scored) >= 2 else 0.0
+                cov = int(S[t][k1].get("coverage", 0))
+                is_anchor = False
+                if s1 - s2 >= float(self.p.anchor_margin_thr):
+                    is_anchor = True
+                elif (s2 > 0.0) and (s1 / (s2 + 1e-9) >= float(self.p.anchor_ratio_thr)):
+                    is_anchor = True
+                if cov >= int(self.p.anchor_min_coverage):
+                    is_anchor = True
+                if is_anchor:
+                    anchor_idx[t] = k1
+            # lock anchors & set corridors on neighbors
+            for t, k in anchor_idx.items():
+                top = S[t][k]
+                # lock this step to the anchor candidate
+                S[t] = [top]
+                ta = float(top.get("rep_time", 0.0))
+                lo = ta - float(self.p.anchor_corridor_sec)
+                hi = ta + float(self.p.anchor_corridor_sec)
+                for dt in range(1, int(self.p.anchor_span) + 1):
+                    for u in (t - dt, t + dt):
+                        if 0 <= u < T:
+                            rng = allowed_ranges[u]
+                            if rng is None:
+                                allowed_ranges[u] = (lo, hi)
+                            else:
+                                old_lo, old_hi = rng
+                                allowed_ranges[u] = (max(old_lo, lo), min(old_hi, hi))
+            # apply corridor filters (keep non-empty only)
+            for u in range(T):
+                rng = allowed_ranges[u]
+                if rng is None:
+                    continue
+                lo, hi = rng
+                filt = [c for c in S[u] if lo <= float(c.get("rep_time", 0.0)) <= hi]
+                if filt:
+                    S[u] = filt
+
         # dp[t][j][fb] = (cost, prev_j, prev_fb)
         INF = 1e18
         dp: List[List[List[Tuple[float, int, int]]]] = [
@@ -241,14 +306,48 @@ class GlobalTimeChain:
                 best_cost, best_prev_j, best_prev_fb = INF, -1, -1
                 for i, prev in enumerate(S[t-1]):
                     for fb_used in range(self.p.allow_flashbacks + 1):
-                        prev_cost, _, _ = dp[t-1][i][fb_used]
+                        prev_cost, prev_prev_j, _ = dp[t-1][i][fb_used]
                         if prev_cost >= INF:
                             continue
                         trans_pen, fb_inc = self._trans_cost(prev, cur)
+                        # ABA flip-flop penalty (A->B->A)
+                        ff_pen = 0.0
+                        if self.p.flipflop_penalty > 0 and t >= 2 and prev_prev_j >= 0:
+                            try:
+                                prevprev_scene = S[t-2][prev_prev_j].get("scene_id")
+                                prev_scene = S[t-1][i].get("scene_id")
+                                cur_scene = S[t][j].get("scene_id")
+                                if cur_scene == prevprev_scene and cur_scene != prev_scene:
+                                    ff_pen += float(self.p.flipflop_penalty)
+                            except Exception:
+                                pass
                         new_fb = fb_used + fb_inc
                         if new_fb > self.p.allow_flashbacks:
                             continue
-                        total = prev_cost + base + trans_pen
+                        # repeat-with-cooldown: penalize revisits to scenes seen a few steps ago
+                        rc_pen = 0.0
+                        cur_scene = S[t][j].get("scene_id")
+                        # distance 2
+                        if self.p.repeat_cooldown_steps >= 2 and t >= 2 and prev_prev_j >= 0:
+                            scene_t2 = S[t-2][prev_prev_j].get("scene_id")
+                            if cur_scene == scene_t2:
+                                # linear decay with distance
+                                factor = (float(self.p.repeat_cooldown_steps) - (2 - 1)) / max(1.0, float(self.p.repeat_cooldown_steps))
+                                rc_pen += float(self.p.repeat_cooldown_penalty) * max(0.0, factor)
+                            # distance 3 (approx via best predecessor of (t-2, prev_prev_j))
+                            if self.p.repeat_cooldown_steps >= 3 and t >= 3:
+                                INF_L = 1e18
+                                best_cost2, best_prev2 = INF_L, -1
+                                for fb2 in range(self.p.allow_flashbacks + 1):
+                                    c2, ppj2, _ = dp[t-2][prev_prev_j][fb2]
+                                    if c2 < best_cost2:
+                                        best_cost2, best_prev2 = c2, ppj2
+                                if best_prev2 >= 0:
+                                    scene_t3 = S[t-3][best_prev2].get("scene_id")
+                                    if cur_scene == scene_t3:
+                                        factor = (float(self.p.repeat_cooldown_steps) - (3 - 1)) / max(1.0, float(self.p.repeat_cooldown_steps))
+                                        rc_pen += float(self.p.repeat_cooldown_penalty) * max(0.0, factor)
+                        total = prev_cost + base + trans_pen + ff_pen + rc_pen
                         if total < best_cost:
                             best_cost, best_prev_j, best_prev_fb = total, i, new_fb
                 dp[t][j][best_prev_fb if best_prev_fb >= 0 else 0] = (best_cost, best_prev_j, best_prev_fb)
@@ -281,6 +380,34 @@ class GlobalTimeChain:
 
         choice_scene = [S[t][choice_idx[t]]["scene_id"] if choice_idx[t] >= 0 else None for t in range(T)]
         fb_marks.reverse()
+
+        # Post-smoothing: merge A B A into A when B is weaker than neighbors by a margin
+        if self.p.min_run >= 2 and T >= 3:
+            for t2 in range(1, T-1):
+                a = choice_scene[t2-1]
+                b = choice_scene[t2]
+                c = choice_scene[t2+1]
+                if a is None or c is None or b is None:
+                    continue
+                if a == c and b != a:
+                    # candidate indices at t2 for scene 'a'
+                    idxs = [k for k, x in enumerate(S[t2]) if x.get("scene_id") == a]
+                    if not idxs:
+                        continue
+                    # compare normalized scores
+                    def _s(ti, ji):
+                        if ji < 0:
+                            return 0.0
+                        x = S[ti][ji]
+                        return float(x.get("score_norm", x.get("score", 0.0)))
+                    score_mid = _s(t2, choice_idx[t2])
+                    score_nb = 0.5 * (_s(t2-1, choice_idx[t2-1]) + _s(t2+1, choice_idx[t2+1]))
+                    if score_mid + float(self.p.min_run_score_margin) < score_nb:
+                        # switch middle to best candidate of scene 'a'
+                        bestk = max(idxs, key=lambda k: float(S[t2][k].get("score_norm", S[t2][k].get("score", 0.0))))
+                        choice_idx[t2] = bestk
+                        choice_scene[t2] = a
+
         return {
             'choice_idx': choice_idx,
             'choice_scene': choice_scene,
