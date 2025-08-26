@@ -16,4 +16,4 @@ venv/
 *.mkv
 *.mov
 /out/
-/recmatcher.egg-info/
+recmatcher.egg-info/
