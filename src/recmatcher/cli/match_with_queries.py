@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import logging
 import math
+import copy
 def _round_ms(x: float, ms: int = 3) -> int:
     # return integer milliseconds (ms=3) or decimilliseconds if ms=2, etc.
     if x is None:
@@ -133,11 +134,49 @@ def _read_clip_frames(path: Path, n: int = 24) -> np.ndarray:
 from ..matcher.query_io import load_queries
 from ..matcher.stage1_retriever import Stage1Retriever
 from ..matcher.stage2_reranker import Stage2Reranker
+
 from ..utils.io import write_json
 from ..utils.faiss_utils import IdMap
 from ..types import CropVariant
 import csv
 
+# Helper: lightweight explanation writer (can move to recmatcher/utils/explain_writer.py later)
+class ExplainWriter:
+    """
+    Lightweight JSONL writer for per-segment explanations.
+    It emits:
+      - a single 'meta' line with run-level information
+      - one 'segment' line per clip segment
+    """
+    def __init__(self, path: Path, level: str = "full"):
+        self.path = Path(path)
+        self.level = level
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # open in text mode, utf-8, overwrite on each run
+        self._fh = open(self.path, "w", encoding="utf-8")
+    
+    def _write(self, obj: dict):
+        import json as _json
+        self._fh.write(_json.dumps(obj, ensure_ascii=False) + "\n")
+        self._fh.flush()
+    
+    def write_meta(self, meta: dict):
+        rec = {"type": "meta"}
+        rec.update(meta or {})
+        self._write(rec)
+    
+    def write_segment(self, seg: dict):
+        rec = {"type": "segment"}
+        rec.update(seg or {})
+        self._write(rec)
+    
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+#
 # tag -> 索引名 的默认映射（按我们之前的方案）
 VARIANT_MAP = {
     "tight": "centercrop",
@@ -314,6 +353,8 @@ def main():
     ap.add_argument("--clip_segs", required=True, help="同 encode 阶段的分段 JSON（用于输出对齐）")
     ap.add_argument("--store", required=True, help="电影索引根目录（含 movie/index/*.faiss）")
     ap.add_argument("--out", required=True, help="输出 match.json")
+    ap.add_argument("--explain_out", required=False, help="解释输出 JSONL（默认与 --out 同目录的 match_explain.jsonl）")
+    ap.add_argument("--explain_level", choices=["basic", "full"], default="full", help="解释详细程度：basic=关键字段；full=完整字段")
     ap.add_argument("--topk", type=int, default=20)
     ap.add_argument("--movie", required=True)
     ap.add_argument("--movie_segs", required=False, help="电影原片分段 JSON（segs.json）路径；用于按 (t0,t1,scene_id) 反查 seg_id/scene_seg_idx")
@@ -462,6 +503,24 @@ def main():
     # 基于当前查询包估计各变体分数尺度，用于跨变体校准
     calib_tbl = _compute_variant_calib(retr, seg_bags, available_variants)
 
+    # Initialize explain writer (JSONL)
+    explain_path = Path(args.explain_out) if getattr(args, "explain_out", None) else Path(args.out).with_name("match_explain.jsonl")
+    exp_writer = ExplainWriter(explain_path, level=getattr(args, "explain_level", "full"))
+
+    # Emit run-level meta once
+    run_meta = {
+        "available_variants": sorted(list(available_variants)),
+        "variant_calibration": {k: {"median": float(v[0]), "iqr": float(v[1])} for k, v in (calib_tbl or {}).items()},
+        "weights": VAR_WEIGHTS,
+        "vote_tau": VOTE_TAU,
+        "mirror_penalty": MIRROR_PENALTY,
+        "topk": int(args.topk),
+        "nms_sec": float(args.nms_sec or 0.0),
+        "score_source": args.score_source,
+        "movie": args.movie,
+    }
+    exp_writer.write_meta(run_meta)
+
     def retrieve_one_seg(seg_id, bag, topk):
         """bag: {variant(str): [ {"vec": ndarray, "mirrored": bool}, ... ]}
         多变体融合策略：
@@ -471,9 +530,11 @@ def main():
           3) 同时记录该 key 下的最大原始分数（便于保持分数尺度输出）。
         返回 list[dict]，每个 dict 额外带 `vote` 字段作为融合得分。
         """
-        fuse_vote = {}   # key -> 累计票数
-        fuse_meta = {}   # key -> 代表元数据（来自最大原始分数的那一条）
-        fuse_best = {}   # key -> 最大原始分数
+        fuse_vote = {}            # key -> 累计票数
+        fuse_meta = {}            # key -> 代表元数据（来自最大原始分数的那一条）
+        fuse_best = {}            # key -> 最大原始分数
+        fuse_var_votes = {}       # key -> {variant: vote_sum}
+        fuse_any_mirrored = {}    # key -> bool
 
         for var, vec_list in bag.items():
             if var not in available_variants:
@@ -503,6 +564,15 @@ def main():
                     z = (sc - mu) / max(iqr, 1e-3)
                     vote = math.exp(z / VOTE_TAU) * w_var * mir_w
                     fuse_vote[key] = fuse_vote.get(key, 0.0) + vote
+                    # per-variant vote accumulation
+                    if key not in fuse_var_votes:
+                        fuse_var_votes[key] = {}
+                    fuse_var_votes[key][var] = fuse_var_votes[key].get(var, 0.0) + float(vote)
+                    # mirrored flag accumulation
+                    if mir_flags[r]:
+                        fuse_any_mirrored[key] = True
+                    elif key not in fuse_any_mirrored:
+                        fuse_any_mirrored[key] = False
                     # 记录最大原始分数对应的元信息
                     if key not in fuse_best or sc > fuse_best[key]:
                         fuse_best[key] = sc
@@ -526,6 +596,10 @@ def main():
                 "faiss_id": m.get("faiss_id"),
                 "movie_id": m.get("movie_id"),
                 "shot_id": m.get("shot_id"),
+                # explain extras
+                "variant_votes": {vk: float(vv) for vk, vv in (fuse_var_votes.get(key, {}) or {}).items()},
+                "source_variants": sorted(list((fuse_var_votes.get(key, {}) or {}).keys())),
+                "mirrored_any": bool(fuse_any_mirrored.get(key, False)),
             }
             cand = attach_seg_ids_from_meta(cand, movie_exact, movie_by_scene)
             items.append(cand)
@@ -539,18 +613,27 @@ def main():
         sid = s.get("seg_id")
         bag = seg_bags.get(sid, {})
         if not bag:
-            top_items = []
+            top_items_pre = []
         else:
-            top_items = retrieve_one_seg(sid, bag, topk=int(args.topk))
-            if args.nms_sec and args.nms_sec > 0:
-                top_items = _temporal_nms(top_items, win_sec=float(args.nms_sec))
-                
-        # 👉 先按融合投票(vote)降序，再按原始分数与时间稳定排序
+            top_items_pre = retrieve_one_seg(sid, bag, topk=int(args.topk))
+        # 标注 NMS 前排名
+        for _i, _it in enumerate(top_items_pre):
+            _it["pre_nms_rank"] = int(_i + 1)
+        # 备份一份用于 explain（深拷贝）
+        explain_pre = [copy.deepcopy(x) for x in top_items_pre[:max(10, int(args.topk))]]
+        # 可选 NMS
+        if args.nms_sec and args.nms_sec > 0:
+            top_items = _temporal_nms(list(top_items_pre), win_sec=float(args.nms_sec))
+        else:
+            top_items = list(top_items_pre)
+        # 最终排序
         top_items.sort(key=lambda x: (-float(x.get("vote", x.get("score", 0.0))),
                                       -float(x.get("score", 0.0)),
                                       float(x.get("start", 0.0)),
                                       float(x.get("end", 0.0))))
-        
+        for _i, _it in enumerate(top_items):
+            _it["post_nms_rank"] = int(_i + 1)
+
         # Wrap matched_orig_seg and top_matches properly
         def wrap_items(items):
             wrapped = []
@@ -569,6 +652,28 @@ def main():
             return wrapped
         wrapped_top_items = wrap_items(top_items)[:10]
         matched_orig_seg = wrapped_top_items[0] if wrapped_top_items else None
+
+        # 解释输出（每段一行）
+        try:
+            seg_explain = {
+                "seg_id": sid,
+                "clip": {
+                    "scene_seg_idx": s.get("scene_seg_idx"),
+                    "start": float(s.get("start", 0.0)),
+                    "end": float(s.get("end", 0.0)),
+                    "scene_id": s.get("scene_id"),
+                },
+                "candidates_pre": explain_pre[:10],
+                "candidates_post": [copy.deepcopy(x) for x in top_items[:10]],
+                "selected_index": 0 if top_items else None,
+                "time_prior": None,  # 预留：后续接入在线时间映射
+                "mode_prior": None,  # 预留：后续接入裁剪模式先验
+            }
+            exp_writer.write_segment(seg_explain)
+        except Exception:
+            # 解释输出失败不影响主流程
+            pass
+
         out = {
             "seg_id": sid,
             "scene_seg_idx": s.get("scene_seg_idx"),
@@ -588,6 +693,10 @@ def main():
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     write_json(Path(args.out), results)
+    try:
+        exp_writer.close()
+    except Exception:
+        pass
     return
 
 
