@@ -141,13 +141,22 @@ class GlobalChainParams:
     # New: repeat-with-cooldown (penalize short-gap revisits; allow long-gap reprises)
     repeat_cooldown_steps: int = 3           # consider revisits within this many steps (>=2)
     repeat_cooldown_penalty: float = 0.4     # base penalty for a revisit; decays with distance
-    # New: anchors + corridor
+    # New: anchors + corridor (simple, per-step)
     anchor_enable: bool = True
     anchor_ratio_thr: float = 1.8            # top1/top2 ratio to mark an anchor
     anchor_margin_thr: float = 0.15          # or absolute (norm) margin to mark an anchor
     anchor_min_coverage: int = 2             # or coverage >= this
     anchor_span: int = 1                      # affect neighbors within ±span steps
     anchor_corridor_sec: float = 20.0         # keep candidates near the anchor's rep_time (± seconds)
+    # NEW: dual-corridor (main lane + island lane) support (soft penalty)
+    island_enable: bool = True
+    island_time_gap_min: float = 480.0       # seconds; gaps larger than this indicate a far flashback island
+    island_min_len: int = 5                  # minimum consecutive steps to confirm an island
+    island_max_count: int = 2                # at most how many islands we consider
+    lane_switch_penalty: float = 1.0         # penalty for switching lanes (main <-> island)
+    corridor_base: float = 18.0              # base allowed dev from lane center (seconds)
+    corridor_widen: float = 3.0              # optional widening per step from nearest anchor (seconds/step)
+    corridor_lambda: float = 0.03            # per-second corridor deviation penalty
 
 class GlobalTimeChain:
     """
@@ -287,6 +296,102 @@ class GlobalTimeChain:
                 if filt:
                     S[u] = filt
 
+        # ---- Build dual corridors (main lane + island lane) from anchors (soft penalty, not hard filter) ----
+        main_center: List[Optional[float]] = [None] * T
+        island_center: List[Optional[float]] = [None] * T
+        island_ranges: List[Tuple[int, int]] = []
+
+        def _collect_anchors() -> List[Tuple[int, float]]:
+            anchors: List[Tuple[int, float]] = []
+            for t_idx in range(T):
+                if not S[t_idx]:
+                    continue
+                cands_sorted = sorted(S[t_idx], key=lambda c: -float(c.get("score_norm", c.get("score", 0.0))))
+                if not cands_sorted:
+                    continue
+                s1 = float(cands_sorted[0].get("score_norm", cands_sorted[0].get("score", 0.0)))
+                s2 = float(cands_sorted[1].get("score_norm", 0.0)) if len(cands_sorted) >= 2 else 0.0
+                cov = int(cands_sorted[0].get("coverage", 0))
+                strong = False
+                if s1 - s2 >= float(self.p.anchor_margin_thr):
+                    strong = True
+                elif (s2 > 0.0) and (s1 / (s2 + 1e-9) >= float(self.p.anchor_ratio_thr)):
+                    strong = True
+                if cov >= int(self.p.anchor_min_coverage):
+                    strong = True
+                if strong:
+                    anchors.append((t_idx, float(cands_sorted[0].get("rep_time", 0.0))))
+            return anchors
+
+        def _interp_centers(points: List[Tuple[int, float]], out: List[Optional[float]]):
+            if not points:
+                return
+            pts = sorted(points, key=lambda x: x[0])
+            # extend edges
+            for tt in range(0, pts[0][0] + 1):
+                out[tt] = pts[0][1]
+            for tt in range(pts[-1][0], T):
+                out[tt] = pts[-1][1]
+            # linear interpolate between anchors
+            for (t0, v0), (t1, v1) in zip(pts[:-1], pts[1:]):
+                span = max(1, t1 - t0)
+                for k in range(span + 1):
+                    tt = t0 + k
+                    if 0 <= tt < T:
+                        out[tt] = v0 + (v1 - v0) * (k / span)
+
+        if self.p.island_enable and T > 0:
+            anchors = _collect_anchors()
+            if anchors:
+                times = sorted([v for _, v in anchors])
+                med = times[len(times)//2]
+                main_pts: List[Tuple[int, float]] = []
+                island_pts: List[Tuple[int, float]] = []
+                for t_idx, tm in anchors:
+                    if abs(tm - med) >= float(self.p.island_time_gap_min):
+                        island_pts.append((t_idx, tm))
+                    else:
+                        main_pts.append((t_idx, tm))
+                # consolidate island runs
+                if island_pts:
+                    island_pts_sorted = sorted(island_pts, key=lambda x: x[0])
+                    cur_start = cur_end = island_pts_sorted[0][0]
+                    packs: List[Tuple[int, int]] = []
+                    for (tt, _tm) in island_pts_sorted[1:]:
+                        if tt == cur_end + 1:
+                            cur_end = tt
+                        else:
+                            packs.append((cur_start, cur_end))
+                            cur_start = cur_end = tt
+                    packs.append((cur_start, cur_end))
+                    packs = [(a, b) for (a, b) in packs if (b - a + 1) >= int(self.p.island_min_len)]
+                    packs = packs[:int(self.p.island_max_count)]
+                    island_ranges = packs
+                    if packs:
+                        _interp_centers(island_pts, island_center)
+                if main_pts:
+                    _interp_centers(main_pts, main_center)
+        # Fallback for main lane center
+        if all(v is None for v in main_center):
+            for tt in range(T):
+                if S[tt]:
+                    main_center[tt] = float(S[tt][0].get("rep_time", 0.0))
+        # simple constant radius; could widen using self.p.corridor_widen if needed
+        radius = [float(self.p.corridor_base)] * T
+
+        def _lane_penalties(t_idx: int, rep_time: float) -> Tuple[float, float]:
+            pm = float('inf')
+            pi = float('inf')
+            if main_center[t_idx] is not None:
+                pm = max(0.0, abs(rep_time - float(main_center[t_idx])) - radius[t_idx])
+            if island_center[t_idx] is not None:
+                pi = max(0.0, abs(rep_time - float(island_center[t_idx])) - radius[t_idx])
+            return pm, pi
+
+        def _best_lane(t_idx: int, rep_time: float) -> int:
+            pm, pi = _lane_penalties(t_idx, rep_time)
+            return 0 if pm <= pi else 1
+
         # dp[t][j][fb] = (cost, prev_j, prev_fb)
         INF = 1e18
         dp: List[List[List[Tuple[float, int, int]]]] = [
@@ -347,7 +452,17 @@ class GlobalTimeChain:
                                     if cur_scene == scene_t3:
                                         factor = (float(self.p.repeat_cooldown_steps) - (3 - 1)) / max(1.0, float(self.p.repeat_cooldown_steps))
                                         rc_pen += float(self.p.repeat_cooldown_penalty) * max(0.0, factor)
-                        total = prev_cost + base + trans_pen + ff_pen + rc_pen
+                        corr_pen = 0.0
+                        if float(self.p.corridor_lambda) > 0.0:
+                            rt = float(cur.get("rep_time", 0.0))
+                            pm, pi = _lane_penalties(t, rt)
+                            corr_pen += float(self.p.corridor_lambda) * min(pm, pi)
+                            # approximate lane-switch penalty without expanding DP state
+                            if t > 0 and (island_center[t] is not None):
+                                rp = float(prev.get("rep_time", 0.0))
+                                if _best_lane(t, rt) != _best_lane(t-1, rp):
+                                    corr_pen += float(self.p.lane_switch_penalty)
+                        total = prev_cost + base + trans_pen + ff_pen + rc_pen + corr_pen
                         if total < best_cost:
                             best_cost, best_prev_j, best_prev_fb = total, i, new_fb
                 dp[t][j][best_prev_fb if best_prev_fb >= 0 else 0] = (best_cost, best_prev_j, best_prev_fb)
@@ -408,9 +523,47 @@ class GlobalTimeChain:
                         choice_idx[t2] = bestk
                         choice_scene[t2] = a
 
+        # ---- Confidence (per step) combining score, margin, continuity, and corridor compliance ----
+        import math
+        conf: List[float] = [0.0] * T
+        for tt in range(T):
+            if not S[tt] or choice_idx[tt] < 0:
+                conf[tt] = 0.0
+                continue
+            s_sorted = sorted([float(c.get("score_norm", c.get("score", 0.0))) for c in S[tt]], reverse=True)
+            s1 = s_sorted[0]
+            s2 = s_sorted[1] if len(s_sorted) >= 2 else 0.0
+            margin = max(0.0, s1 - s2)
+            ratio = (s1 / (s2 + 1e-6)) if s2 > 0 else (1.0 + s1)
+            cont = 0.0
+            if tt > 0 and choice_idx[tt-1] >= 0:
+                rt = float(S[tt][choice_idx[tt]].get("rep_time", 0.0))
+                rp = float(S[tt-1][choice_idx[tt-1]].get("rep_time", 0.0))
+                dt = rt - rp
+                if dt >= 0:
+                    cont = 1.0 if dt <= 8.0 else max(0.0, 1.0 - (dt - 8.0) / 20.0)
+            # corridor deviation (use best lane)
+            outcorr = 0.0
+            rt = float(S[tt][choice_idx[tt]].get("rep_time", 0.0))
+            pm, pi = _lane_penalties(tt, rt)
+            outcorr = min(pm, pi)
+            outcorr = min(60.0, outcorr) / 60.0
+            flip = 0.0
+            if tt >= 2 and choice_scene[tt] == choice_scene[tt-2] and choice_scene[tt] != choice_scene[tt-1]:
+                flip = 1.0
+            z = (1.0 * s1 + 0.6 * math.log(max(1.0, ratio)) + 0.6 * margin + 0.6 * cont - 0.8 * outcorr - 0.7 * flip)
+            conf[tt] = 1.0 / (1.0 + math.exp(-z))
+
         return {
             'choice_idx': choice_idx,
             'choice_scene': choice_scene,
             'flashbacks': fb_marks,
             'cost': float(cost),
+            'confidence': conf,
+            'corridor': {
+                'main_center': main_center,
+                'island_center': island_center,
+                'island_ranges': island_ranges,
+                'radius': radius,
+            },
         }
