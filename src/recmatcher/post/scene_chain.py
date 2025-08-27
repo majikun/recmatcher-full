@@ -143,20 +143,20 @@ class GlobalChainParams:
     repeat_cooldown_penalty: float = 0.4     # base penalty for a revisit; decays with distance
     # New: anchors + corridor (simple, per-step)
     anchor_enable: bool = True
-    anchor_ratio_thr: float = 1.8            # top1/top2 ratio to mark an anchor
-    anchor_margin_thr: float = 0.15          # or absolute (norm) margin to mark an anchor
-    anchor_min_coverage: int = 2             # or coverage >= this
+    anchor_ratio_thr: float = 1.4            # top1/top2 ratio to mark an anchor
+    anchor_margin_thr: float = 0.08          # or absolute (norm) margin to mark an anchor
+    anchor_min_coverage: int = 1             # or coverage >= this
     anchor_span: int = 1                      # affect neighbors within ±span steps
     anchor_corridor_sec: float = 20.0         # keep candidates near the anchor's rep_time (± seconds)
     # NEW: dual-corridor (main lane + island lane) support (soft penalty)
     island_enable: bool = True
-    island_time_gap_min: float = 480.0       # seconds; gaps larger than this indicate a far flashback island
-    island_min_len: int = 5                  # minimum consecutive steps to confirm an island
+    island_time_gap_min: float = 300.0       # seconds; gaps larger than this indicate a far flashback island
+    island_min_len: int = 4                  # minimum consecutive steps to confirm an island
     island_max_count: int = 2                # at most how many islands we consider
-    lane_switch_penalty: float = 1.0         # penalty for switching lanes (main <-> island)
-    corridor_base: float = 18.0              # base allowed dev from lane center (seconds)
+    lane_switch_penalty: float = 1.2         # penalty for switching lanes (main <-> island)
+    corridor_base: float = 26.0              # base allowed dev from lane center (seconds)
     corridor_widen: float = 3.0              # optional widening per step from nearest anchor (seconds/step)
-    corridor_lambda: float = 0.03            # per-second corridor deviation penalty
+    corridor_lambda: float = 0.06            # per-second corridor deviation penalty
 
 class GlobalTimeChain:
     """
@@ -371,6 +371,56 @@ class GlobalTimeChain:
                         _interp_centers(island_pts, island_center)
                 if main_pts:
                     _interp_centers(main_pts, main_center)
+        # ---- Fallback: if no island center inferred from anchors, try 2-cluster over top-1 rep_time ----
+        if self.p.island_enable and all(v is None for v in island_center) and T > 2:
+            top1_times: List[Tuple[int, float]] = []
+            for tt in range(T):
+                if not S[tt]:
+                    continue
+                # take top-1 by normalized score
+                top = max(S[tt], key=lambda c: float(c.get("score_norm", c.get("score", 0.0))))
+                top1_times.append((tt, float(top.get("rep_time", 0.0))))
+            if len(top1_times) >= 4:
+                # simple 1D 2-cluster by largest gap in sorted times
+                times_sorted = sorted(top1_times, key=lambda x: x[1])
+                gaps: List[Tuple[float, int]] = []  # (gap, index)
+                for k in range(1, len(times_sorted)):
+                    gaps.append((times_sorted[k][1] - times_sorted[k-1][1], k))
+                if gaps:
+                    max_gap, split_k = max(gaps, key=lambda x: x[0])
+                    # treat as two clusters only if gap is large enough
+                    if max_gap >= float(self.p.island_time_gap_min):
+                        left = times_sorted[:split_k]
+                        right = times_sorted[split_k:]
+                        # main cluster is the larger one
+                        main_cluster = left if len(left) >= len(right) else right
+                        island_cluster = right if main_cluster is left else left
+                        # require minimum consecutive coverage to accept island
+                        # project island_cluster indices to runs in t-index space
+                        idxs = sorted([tt for tt, _ in island_cluster])
+                        runs: List[Tuple[int, int]] = []
+                        cur_s = cur_e = idxs[0]
+                        for u in idxs[1:]:
+                            if u == cur_e + 1:
+                                cur_e = u
+                            else:
+                                runs.append((cur_s, cur_e))
+                                cur_s = cur_e = u
+                        runs.append((cur_s, cur_e))
+                        runs = [(a, b) for (a, b) in runs if (b - a + 1) >= int(self.p.island_min_len)]
+                        if runs:
+                            island_ranges = runs[:int(self.p.island_max_count)]
+                            # set centers as piecewise constants per cluster (could be smoothed but okay for penalty)
+                            if main_cluster:
+                                mval = sum(v for _, v in main_cluster) / float(len(main_cluster))
+                                for tt, _ in top1_times:
+                                    main_center[tt] = mval
+                            if island_cluster:
+                                ival = sum(v for _, v in island_cluster) / float(len(island_cluster))
+                                for tt, _ in top1_times:
+                                    # only set where tt in island runs to keep it selective
+                                    if any(a <= tt <= b for (a, b) in island_ranges):
+                                        island_center[tt] = ival
         # Fallback for main lane center
         if all(v is None for v in main_center):
             for tt in range(T):

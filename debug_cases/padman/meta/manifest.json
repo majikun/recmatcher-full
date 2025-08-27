@@ -1,0 +1,53 @@
+{
+  "variants": [
+    {
+      "file": "tight.npy",
+      "tag": "tight",
+      "mirrored": false,
+      "count": 71
+    },
+    {
+      "file": "tight_m.npy",
+      "tag": "tight",
+      "mirrored": true,
+      "count": 71
+    },
+    {
+      "file": "context.npy",
+      "tag": "context",
+      "mirrored": false,
+      "count": 71
+    },
+    {
+      "file": "context_m.npy",
+      "tag": "context",
+      "mirrored": true,
+      "count": 71
+    },
+    {
+      "file": "left.npy",
+      "tag": "left",
+      "mirrored": false,
+      "count": 71
+    },
+    {
+      "file": "left_m.npy",
+      "tag": "left",
+      "mirrored": true,
+      "count": 71
+    },
+    {
+      "file": "right.npy",
+      "tag": "right",
+      "mirrored": false,
+      "count": 71
+    },
+    {
+      "file": "right_m.npy",
+      "tag": "right",
+      "mirrored": true,
+      "count": 71
+    }
+  ],
+  "dim": 768
+}

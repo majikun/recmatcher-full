@@ -1,8 +1,5 @@
 __pycache__/
 *.py[cod]
-*.npz
-*.npy
-*.faiss
 *.parquet
 .DS_Store
 .venv/
@@ -10,8 +7,6 @@ env/
 venv/
 .vscode/
 .idea/
-**/emb/
-**/index/
 *.mp4
 *.mkv
 *.mov

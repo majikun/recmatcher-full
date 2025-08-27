@@ -1,0 +1,434 @@
+[
+  {
+    "seg_idx": 0,
+    "start": 0.0,
+    "end": 1.483,
+    "scene_id": 1
+  },
+  {
+    "seg_idx": 1,
+    "start": 1.483,
+    "end": 2.586,
+    "scene_id": 2
+  },
+  {
+    "seg_idx": 2,
+    "start": 2.586,
+    "end": 3.483,
+    "scene_id": 3
+  },
+  {
+    "seg_idx": 3,
+    "start": 3.483,
+    "end": 5.31,
+    "scene_id": 4
+  },
+  {
+    "seg_idx": 4,
+    "start": 5.31,
+    "end": 6.569,
+    "scene_id": 5
+  },
+  {
+    "seg_idx": 5,
+    "start": 6.569,
+    "end": 7.828,
+    "scene_id": 5
+  },
+  {
+    "seg_idx": 6,
+    "start": 7.828,
+    "end": 8.845,
+    "scene_id": 6
+  },
+  {
+    "seg_idx": 7,
+    "start": 8.845,
+    "end": 9.862,
+    "scene_id": 6
+  },
+  {
+    "seg_idx": 8,
+    "start": 9.862,
+    "end": 11.586,
+    "scene_id": 7
+  },
+  {
+    "seg_idx": 9,
+    "start": 11.586,
+    "end": 12.793,
+    "scene_id": 8
+  },
+  {
+    "seg_idx": 10,
+    "start": 12.793,
+    "end": 14.0,
+    "scene_id": 8
+  },
+  {
+    "seg_idx": 11,
+    "start": 14.0,
+    "end": 15.069,
+    "scene_id": 9
+  },
+  {
+    "seg_idx": 12,
+    "start": 15.069,
+    "end": 16.241,
+    "scene_id": 10
+  },
+  {
+    "seg_idx": 13,
+    "start": 16.241,
+    "end": 17.276,
+    "scene_id": 11
+  },
+  {
+    "seg_idx": 14,
+    "start": 17.276,
+    "end": 18.621,
+    "scene_id": 12
+  },
+  {
+    "seg_idx": 15,
+    "start": 18.621,
+    "end": 19.414,
+    "scene_id": 13
+  },
+  {
+    "seg_idx": 16,
+    "start": 19.414,
+    "end": 20.483,
+    "scene_id": 14
+  },
+  {
+    "seg_idx": 17,
+    "start": 20.483,
+    "end": 21.724,
+    "scene_id": 15
+  },
+  {
+    "seg_idx": 18,
+    "start": 21.724,
+    "end": 22.897,
+    "scene_id": 16
+  },
+  {
+    "seg_idx": 19,
+    "start": 22.897,
+    "end": 23.931,
+    "scene_id": 17
+  },
+  {
+    "seg_idx": 20,
+    "start": 23.931,
+    "end": 25.621,
+    "scene_id": 18
+  },
+  {
+    "seg_idx": 21,
+    "start": 25.621,
+    "end": 27.207,
+    "scene_id": 19
+  },
+  {
+    "seg_idx": 22,
+    "start": 27.207,
+    "end": 28.966,
+    "scene_id": 20
+  },
+  {
+    "seg_idx": 23,
+    "start": 28.966,
+    "end": 30.121,
+    "scene_id": 21
+  },
+  {
+    "seg_idx": 24,
+    "start": 30.121,
+    "end": 31.276,
+    "scene_id": 21
+  },
+  {
+    "seg_idx": 25,
+    "start": 31.276,
+    "end": 32.483,
+    "scene_id": 22
+  },
+  {
+    "seg_idx": 26,
+    "start": 32.483,
+    "end": 33.758,
+    "scene_id": 23
+  },
+  {
+    "seg_idx": 27,
+    "start": 33.758,
+    "end": 35.034,
+    "scene_id": 23
+  },
+  {
+    "seg_idx": 28,
+    "start": 35.034,
+    "end": 36.241,
+    "scene_id": 24
+  },
+  {
+    "seg_idx": 29,
+    "start": 36.241,
+    "end": 37.69,
+    "scene_id": 25
+  },
+  {
+    "seg_idx": 30,
+    "start": 37.69,
+    "end": 38.655,
+    "scene_id": 26
+  },
+  {
+    "seg_idx": 31,
+    "start": 38.655,
+    "end": 39.724,
+    "scene_id": 27
+  },
+  {
+    "seg_idx": 32,
+    "start": 39.724,
+    "end": 41.0,
+    "scene_id": 28
+  },
+  {
+    "seg_idx": 33,
+    "start": 41.0,
+    "end": 42.759,
+    "scene_id": 29
+  },
+  {
+    "seg_idx": 34,
+    "start": 42.759,
+    "end": 44.207,
+    "scene_id": 30
+  },
+  {
+    "seg_idx": 35,
+    "start": 44.207,
+    "end": 44.862,
+    "scene_id": 31
+  },
+  {
+    "seg_idx": 36,
+    "start": 44.862,
+    "end": 46.517,
+    "scene_id": 32
+  },
+  {
+    "seg_idx": 37,
+    "start": 46.517,
+    "end": 48.0,
+    "scene_id": 33
+  },
+  {
+    "seg_idx": 38,
+    "start": 48.0,
+    "end": 49.5,
+    "scene_id": 34
+  },
+  {
+    "seg_idx": 39,
+    "start": 49.5,
+    "end": 51.0,
+    "scene_id": 34
+  },
+  {
+    "seg_idx": 40,
+    "start": 51.0,
+    "end": 53.0,
+    "scene_id": 35
+  },
+  {
+    "seg_idx": 41,
+    "start": 53.0,
+    "end": 54.241,
+    "scene_id": 36
+  },
+  {
+    "seg_idx": 42,
+    "start": 54.241,
+    "end": 55.379,
+    "scene_id": 37
+  },
+  {
+    "seg_idx": 43,
+    "start": 55.379,
+    "end": 56.517,
+    "scene_id": 37
+  },
+  {
+    "seg_idx": 44,
+    "start": 56.517,
+    "end": 57.535,
+    "scene_id": 38
+  },
+  {
+    "seg_idx": 45,
+    "start": 57.535,
+    "end": 58.552,
+    "scene_id": 38
+  },
+  {
+    "seg_idx": 46,
+    "start": 58.552,
+    "end": 60.448,
+    "scene_id": 39
+  },
+  {
+    "seg_idx": 47,
+    "start": 60.448,
+    "end": 62.276,
+    "scene_id": 40
+  },
+  {
+    "seg_idx": 48,
+    "start": 62.276,
+    "end": 63.793,
+    "scene_id": 41
+  },
+  {
+    "seg_idx": 49,
+    "start": 63.793,
+    "end": 64.517,
+    "scene_id": 42
+  },
+  {
+    "seg_idx": 50,
+    "start": 64.517,
+    "end": 65.69,
+    "scene_id": 43
+  },
+  {
+    "seg_idx": 51,
+    "start": 65.69,
+    "end": 67.241,
+    "scene_id": 44
+  },
+  {
+    "seg_idx": 52,
+    "start": 67.241,
+    "end": 68.414,
+    "scene_id": 45
+  },
+  {
+    "seg_idx": 53,
+    "start": 68.414,
+    "end": 69.966,
+    "scene_id": 46
+  },
+  {
+    "seg_idx": 54,
+    "start": 69.966,
+    "end": 71.103,
+    "scene_id": 47
+  },
+  {
+    "seg_idx": 55,
+    "start": 71.103,
+    "end": 72.724,
+    "scene_id": 48
+  },
+  {
+    "seg_idx": 56,
+    "start": 72.724,
+    "end": 74.034,
+    "scene_id": 49
+  },
+  {
+    "seg_idx": 57,
+    "start": 74.034,
+    "end": 75.345,
+    "scene_id": 50
+  },
+  {
+    "seg_idx": 58,
+    "start": 75.345,
+    "end": 76.31,
+    "scene_id": 51
+  },
+  {
+    "seg_idx": 59,
+    "start": 76.31,
+    "end": 77.31,
+    "scene_id": 52
+  },
+  {
+    "seg_idx": 60,
+    "start": 77.31,
+    "end": 78.414,
+    "scene_id": 53
+  },
+  {
+    "seg_idx": 61,
+    "start": 78.414,
+    "end": 79.552,
+    "scene_id": 54
+  },
+  {
+    "seg_idx": 62,
+    "start": 79.552,
+    "end": 81.172,
+    "scene_id": 55
+  },
+  {
+    "seg_idx": 63,
+    "start": 81.172,
+    "end": 82.241,
+    "scene_id": 56
+  },
+  {
+    "seg_idx": 64,
+    "start": 82.241,
+    "end": 83.31,
+    "scene_id": 56
+  },
+  {
+    "seg_idx": 65,
+    "start": 83.31,
+    "end": 84.483,
+    "scene_id": 57
+  },
+  {
+    "seg_idx": 66,
+    "start": 84.483,
+    "end": 85.655,
+    "scene_id": 57
+  },
+  {
+    "seg_idx": 67,
+    "start": 85.655,
+    "end": 86.828,
+    "scene_id": 58
+  },
+  {
+    "seg_idx": 68,
+    "start": 86.828,
+    "end": 87.966,
+    "scene_id": 59
+  },
+  {
+    "seg_idx": 69,
+    "start": 87.966,
+    "end": 89.0,
+    "scene_id": 60
+  },
+  {
+    "seg_idx": 70,
+    "start": 89.0,
+    "end": 90.034,
+    "scene_id": 60
+  },
+  {
+    "seg_idx": 71,
+    "start": 90.034,
+    "end": 90.034,
+    "scene_id": -1
+  }
+]
