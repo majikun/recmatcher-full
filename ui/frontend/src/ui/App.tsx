@@ -1,6 +1,17 @@
-import React, {useEffect, useState} from 'react'
-import {openProject,listScenes,listSegments,applyChanges,save} from '../api'
+import React, {useEffect, useMemo, useRef, useState} from 'react'
+import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene} from '../api'
+
+const BACKEND_BASE = `${window.location.protocol}//${window.location.hostname}:8787`
+
 type Scene = {clip_scene_id:number,count:number,avg_conf:number,chain_len:number}
+
+type SegmentRow = {
+  seg_id: number
+  clip: { scene_seg_idx?: number, start?: number, end?: number, scene_id?: number }
+  matched_orig_seg?: any
+  top_matches?: any[]
+}
+
 export default function App(){
   const [root,setRoot]=useState(''); const [movie,setMovie]=useState(''); const [clip,setClip]=useState('')
 
@@ -16,51 +27,262 @@ export default function App(){
     } catch {}
   }, []);
 
-  const [scenes,setScenes]=useState<Scene[]>([]); const [active,setActive]=useState<number|null>(null)
-  const [segments,setSegments]=useState<any[]>([])
-  async function doOpen(){
-    await openProject(root, movie||undefined, clip||undefined)
-    const arr: Scene[] = await listScenes()
-    setScenes(arr)
-    if (arr && arr.length) setActive(arr[0].clip_scene_id)
+  const [scenes,setScenes]=useState<Scene[]>([])
+  const [activeScene,setActiveScene]=useState<number|null>(null)
+  const [segments,setSegments]=useState<SegmentRow[]>([])
+  const [selectedSegId,setSelectedSegId]=useState<number|null>(null)
+  const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
+  const [followMovie,setFollowMovie]=useState<boolean>(true)
+  const [loop,setLoop]=useState<boolean>(true)
+
+  const clipRef = useRef<HTMLVideoElement|null>(null)
+  const movieRef = useRef<HTMLVideoElement|null>(null)
+
+  const clipLoopHandlerRef = useRef<any>(null)
+  const movieLoopHandlerRef = useRef<any>(null)
+
+  const [debug, setDebug] = useState<boolean>(true)
+  const clipLastLogRef = useRef<number>(0)
+  const movieLastLogRef = useRef<number>(0)
+  const clipSeekingRef = useRef<boolean>(false)
+  const movieSeekingRef = useRef<boolean>(false)
+  const dlog = (...args:any[]) => { if (debug) console.log('[UI]', ...args) }
+
+  const [clipSrc, setClipSrc] = useState<string>(`${BACKEND_BASE}/video/clip`)
+  const [movieSrc, setMovieSrc] = useState<string>(`${BACKEND_BASE}/video/movie`)
+
+  async function refreshScenes(){
+    try {
+      const arr: Scene[] = await listScenes()
+      setScenes(arr)
+      if (arr && arr.length) {
+        setActiveScene(arr[0].clip_scene_id)
+      }
+    } catch (e) {
+      console.error('listScenes failed', e)
+    }
   }
-  useEffect(()=>{ if(active!=null){ listSegments(active).then(setSegments) } },[active])
+
+  async function doOpen(){
+    try {
+      await openProject(root, movie||undefined, clip||undefined)
+    } catch (e) {
+      console.error('openProject failed', e)
+    }
+    await refreshScenes()
+  }
+
+  // load segments when scene changes
+  useEffect(()=>{
+    if(activeScene!=null){
+      listSegments(activeScene).then(arr=>{
+        setSegments(arr)
+        if (arr && arr.length){
+          setSelectedSegId(arr[0].seg_id)
+          setSelectedCandIdx(0)
+        } else {
+          setSelectedSegId(null)
+        }
+      })
+    }
+  },[activeScene])
+
+  // derive selected row
+  const selectedRow: SegmentRow | undefined = useMemo(()=>{
+    return segments.find(s=>s.seg_id===selectedSegId)
+  },[segments,selectedSegId])
+
+  function seekWhenReady(v: HTMLVideoElement | null, t: number){
+    if (!v) return
+    const doSeek = () => { try { v.currentTime = Math.max(t, 0); dlog('set currentTime', t, 'ready=', v.readyState) } catch {} }
+    if (v.readyState >= 1) {
+      doSeek()
+    } else {
+      dlog('wait loadedmetadata before seek to', t)
+      const onMeta = () => { v.removeEventListener('loadedmetadata', onMeta); doSeek() }
+      v.addEventListener('loadedmetadata', onMeta)
+    }
+  }
+
+  function attachLoopSafe(v: HTMLVideoElement | null, s: number, e: number, ref: React.MutableRefObject<any>, seekingRef: React.MutableRefObject<boolean>){
+    if (!v) return
+    if (ref.current) {
+      v.removeEventListener('timeupdate', ref.current)
+      ref.current = null
+    }
+    const handler = () => {
+      if (!loop) return
+      if (seekingRef?.current) return
+      const span = e - s
+      if (span > 0.05 && v.currentTime > e - 0.03) {
+        try { v.currentTime = s } catch {}
+      }
+    }
+    v.addEventListener('timeupdate', handler)
+    ref.current = handler
+  }
+
+  // Seek videos to the currently selected row (clip uses clip times, movie uses current choice/candidate)
+  function seekTo(row?: SegmentRow, candIdx?: number){
+    const r = row || selectedRow
+    if (!r) return
+    const clipStart = r.clip.start ?? 0
+    const clipEnd = r.clip.end ?? (clipStart + 2)
+    // candidate or current matched selection
+    let mo = r.matched_orig_seg || {}
+    const cand = (r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null
+    if (followMovie){
+      if (cand) mo = cand
+    }
+    const movStart = mo?.start ?? 0
+    const movEnd = mo?.end ?? (movStart + 2)
+
+    dlog('seekTo', { seg_id: r.seg_id, clipStart, clipEnd, movStart, movEnd, followMovie })
+
+    const cv = clipRef.current
+    const mv = movieRef.current
+
+    // Force start-at-time via Media Fragments to improve reliability across browsers/proxies
+    setClipSrc(`${BACKEND_BASE}/video/clip?t=${clipStart.toFixed(3)}`)
+    if (followMovie) {
+      setMovieSrc(`${BACKEND_BASE}/video/movie?t=${movStart.toFixed(3)}`)
+    }
+
+    // seek (wait for metadata if needed)
+    seekWhenReady(cv, clipStart)
+    seekWhenReady(mv, movStart)
+
+    // optional autoplay (best-effort)
+    try { cv && cv.play().catch(()=>{}) } catch {}
+    try { mv && mv.play().catch(()=>{}) } catch {}
+
+    // loop handlers with cleanup
+    attachLoopSafe(cv, clipStart, clipEnd, clipLoopHandlerRef, clipSeekingRef)
+    attachLoopSafe(mv, movStart, movEnd, movieLoopHandlerRef, movieSeekingRef)
+  }
+
+  // When selection or candidate selection changes, seek
+  useEffect(()=>{ seekTo() },[selectedSegId, selectedCandIdx, followMovie])
+
+  // Accept selected candidate for selected row
+  async function acceptSelected(){
+    const r = selectedRow
+    if (!r) return
+    const cand = (r.top_matches && r.top_matches[selectedCandIdx]) || null
+    if (!cand) return
+    await applyChanges([{ seg_id: r.seg_id, chosen: cand }])
+    // reload and advance to next row
+    const arr = await listSegments(activeScene!)
+    setSegments(arr)
+    const idx = arr.findIndex(x=>x.seg_id===r.seg_id)
+    const next = idx>=0 && idx+1 < arr.length ? arr[idx+1].seg_id : r.seg_id
+    setSelectedSegId(next)
+    setSelectedCandIdx(0)
+  }
+
+  // Scene level rebuild
+  async function doRebuild(){
+    if (activeScene==null) return
+    await rebuildScene(activeScene)
+    const arr = await listSegments(activeScene)
+    setSegments(arr)
+  }
+
   return <div className='layout'>
     <div className='toolbar'>
       <input style={{width:320}} placeholder='project root' value={root} onChange={e=>{ const v=e.target.value; setRoot(v); try{ localStorage.setItem('rm_root', v); }catch{} }} />
       <input style={{width:260}} placeholder='movie.mp4 (optional)' value={movie} onChange={e=>{ const v=e.target.value; setMovie(v); try{ localStorage.setItem('rm_movie', v); }catch{} }} />
       <input style={{width:260}} placeholder='clip.mp4 (optional)' value={clip} onChange={e=>{ const v=e.target.value; setClip(v); try{ localStorage.setItem('rm_clip', v); }catch{} }} />
-      <button onClick={doOpen}>打开</button><div style={{flex:1}}/>
+      <button onClick={doOpen}>打开</button><button onClick={refreshScenes}>刷新场景</button><div style={{flex:1}}/>
+      <label style={{marginRight:12}}><input type='checkbox' checked={followMovie} onChange={e=>setFollowMovie(e.target.checked)} /> 跟随Movie候选</label>
+      <label style={{marginRight:12}}><input type='checkbox' checked={loop} onChange={e=>setLoop(e.target.checked)} /> 循环当前段</label>
+      <label style={{marginRight:12}}><input type='checkbox' checked={debug} onChange={e=>setDebug(e.target.checked)} /> 调试日志</label>
+      <button onClick={doRebuild}>场景内重建</button>
       <button onClick={()=>save()}>保存导出</button>
     </div>
+
     <div className='main'>
       <div className='panel'>
         <div style={{fontWeight:600,marginBottom:6}}>Clip 场景</div>
         <div className='scene-list'>
+          {Array.isArray(scenes) && scenes.length===0 && (
+            <div style={{fontSize:12,opacity:.7,padding:'8px 4px'}}>无场景数据：检查项目根目录是否包含 match_segments.json / scene_out.json；或点击“刷新场景”。</div>
+          )}
           {Array.isArray(scenes) && scenes.map((s:Scene)=>(
             <div key={s.clip_scene_id}
-                 className={'scene-item '+(active===s.clip_scene_id?'active':'')}
-                 onClick={()=>setActive(s.clip_scene_id)}>
+                 className={'scene-item '+(activeScene===s.clip_scene_id?'active':'')}
+                 onClick={()=>setActiveScene(s.clip_scene_id)}>
               <div>#{s.clip_scene_id}</div>
               <div className='badge'>{s.count} / len {s.chain_len}</div>
             </div>
           ))}
         </div>
       </div>
+
       <div className='panel'>
         <div className='videos'>
-          <div><div style={{fontSize:12,opacity:.7,marginBottom:4}}>Clip</div><video src='/api/video/clip' controls/></div>
-          <div><div style={{fontSize:12,opacity:.7,marginBottom:4}}>Movie</div><video src='/api/video/movie' controls/></div>
+          <div><div style={{fontSize:12,opacity:.7,marginBottom:4}}>Clip</div><video preload="metadata" ref={clipRef} src={clipSrc} controls
+                 onLoadedMetadata={e=>{ const v=e.currentTarget as HTMLVideoElement; if (debug) console.log('[Clip] loadedmetadata dur=', v.duration) }}
+                 onError={e=>{ console.error('[Clip] error', e) }}
+                 onSeeking={e=>{ clipSeekingRef.current = true; if (debug) console.log('[Clip] seeking to', (e.currentTarget as HTMLVideoElement).currentTime) }}
+                 onSeeked={e=>{ clipSeekingRef.current = false; if (debug) console.log('[Clip] seeked to', (e.currentTarget as HTMLVideoElement).currentTime) }}
+                 onTimeUpdate={e=>{ const now=Date.now(); if (now - clipLastLogRef.current > 1000 && debug){ clipLastLogRef.current = now; console.log('[Clip] t=', (e.currentTarget as HTMLVideoElement).currentTime) } }}
+          /></div>
+          <div><div style={{fontSize:12,opacity:.7,marginBottom:4}}>Movie</div><video preload="metadata" ref={movieRef} src={movieSrc} controls
+                 onLoadedMetadata={e=>{ const v=e.currentTarget as HTMLVideoElement; if (debug) console.log('[Movie] loadedmetadata dur=', v.duration) }}
+                 onError={e=>{ console.error('[Movie] error', e) }}
+                 onSeeking={e=>{ movieSeekingRef.current = true; if (debug) console.log('[Movie] seeking to', (e.currentTarget as HTMLVideoElement).currentTime) }}
+                 onSeeked={e=>{ movieSeekingRef.current = false; if (debug) console.log('[Movie] seeked to', (e.currentTarget as HTMLVideoElement).currentTime) }}
+                 onTimeUpdate={e=>{ const now=Date.now(); if (now - movieLastLogRef.current > 1000 && debug){ movieLastLogRef.current = now; console.log('[Movie] t=', (e.currentTarget as HTMLVideoElement).currentTime) } }}
+          /></div>
         </div>
-        <table className='seg-table'><thead><tr><th>seg_id</th><th>clip idx</th><th>clip t</th><th>matched scene/idx</th><th>score</th><th>操作</th></tr></thead>
-          <tbody>{segments.map((s:any)=>{ const mo=s.matched_orig_seg||{}; const t=`${(s.clip.start??0).toFixed(2)}-${(s.clip.end??0).toFixed(2)}`
-            return <tr key={s.seg_id}><td>{s.seg_id}</td><td>{s.clip.scene_seg_idx}</td><td>{t}</td>
-              <td>{mo.scene_id??'-'} / {mo.scene_seg_idx??'-'}</td><td>{(mo.score??0).toFixed(3)}</td>
-              <td><button onClick={()=>{ const cand=(s.top_matches&&s.top_matches[0])||null; if(!cand) return;
-                applyChanges([{seg_id:s.seg_id, chosen:cand}]).then(()=>listSegments(active!).then(setSegments))}}>接受候选</button></td>
-            </tr>})}</tbody></table>
+
+        <table className='seg-table'>
+          <thead><tr><th>seg_id</th><th>clip idx</th><th>clip t</th><th>matched scene/idx</th><th>score</th><th>操作</th></tr></thead>
+          <tbody>
+            {segments.map((s:SegmentRow)=>{
+              const mo = s.matched_orig_seg || {}
+              const t = `${(s.clip.start??0).toFixed(2)}-${(s.clip.end??0).toFixed(2)}`
+              const isSel = selectedSegId===s.seg_id
+              return <tr key={s.seg_id}
+                         style={{background:isSel?'#f7fbff':'transparent', cursor:'pointer'}}
+                         onClick={()=>{ setSelectedSegId(s.seg_id); setSelectedCandIdx(0); seekTo(s,0)} }>
+                <td>{s.seg_id}</td>
+                <td>{s.clip.scene_seg_idx}</td>
+                <td>{t}</td>
+                <td>{mo.scene_id??'-'} / {mo.scene_seg_idx??'-'}</td>
+                <td>{(mo.score??0).toFixed(3)}</td>
+                <td>
+                  <button onClick={(e)=>{ e.stopPropagation(); acceptSelected() }}>接受候选</button>
+                </td>
+              </tr>
+            })}
+          </tbody>
+        </table>
       </div>
-      <div className='panel'><div style={{fontWeight:600,marginBottom:6}}>候选（当前段）</div><div style={{fontSize:12,opacity:.7}}>待实现</div></div>
+
+      <div className='panel'>
+        <div style={{fontWeight:600,marginBottom:6}}>候选（当前段）</div>
+        {!selectedRow && <div style={{fontSize:12,opacity:.7}}>选中一行以查看候选</div>}
+        {selectedRow && <div>
+          {(selectedRow.top_matches||[]).slice(0,9).map((c:any,i:number)=>{
+            const on = i===selectedCandIdx
+            return <div key={i} className='candidate'
+                        style={{borderColor:on?'#409eff':'#eee', background:on?'#f5fbff':'#fff'}}
+                        onClick={()=>{ setSelectedCandIdx(i); seekTo(selectedRow,i) }}>
+              <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                <div>scene {c.scene_id} / idx {c.scene_seg_idx}</div>
+                <div style={{fontWeight:600}}>{(c.score??0).toFixed(3)}</div>
+              </div>
+              <div style={{fontSize:12,opacity:.7}}>t {c.start?.toFixed?.(2) ?? c.start} - {c.end?.toFixed?.(2) ?? c.end}</div>
+            </div>
+          })}
+          <div style={{display:'flex', gap:8}}>
+            <button onClick={acceptSelected}>应用所选</button>
+            <button onClick={()=>{ setSelectedCandIdx(0); seekTo(selectedRow,0) }}>选Top1</button>
+          </div>
+        </div>}
+      </div>
     </div>
   </div>
 }

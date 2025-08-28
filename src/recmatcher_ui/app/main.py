@@ -1,7 +1,10 @@
 from __future__ import annotations
-from fastapi import FastAPI, HTTPException, Query
+import os
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
+import subprocess, os
 from .state import STATE
 from .schemas import OpenProjectReq, ApplyBatchReq, SaveReq
 from .utils import group_by_clip_scene
@@ -58,16 +61,60 @@ def open_project(req: OpenProjectReq):
     return {"ok": True, "scenes": scenes, "paths": STATE.paths}
 
 @app.get("/video/movie")
-def video_movie():
+def video_movie(t: float | None = Query(None)):
     p = STATE.paths.get("movie")
-    if not p or not Path(p).exists(): raise HTTPException(404,"movie not set")
-    return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
+    if not p or not Path(p).exists():
+        raise HTTPException(404, "movie not set")
+    if t is None:
+        # 原样返回完整文件（不支持拖动，但可用于小文件或兜底）
+        return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
+    # 从 t 秒起播（推荐）
+    return stream_mp4_from_time(p, t)
 
 @app.get("/video/clip")
-def video_clip():
+def video_clip(t: float | None = Query(None)):
     p = STATE.paths.get("clip")
-    if not p or not Path(p).exists(): raise HTTPException(404,"clip not set")
-    return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
+    if not p or not Path(p).exists():
+        raise HTTPException(404, "clip not set")
+    if t is None:
+        return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
+    return stream_mp4_from_time(p, t)
+
+def stream_mp4_from_time(path: str, t: float):
+    """
+    用 ffmpeg 无重编码从 t 秒开始输出可流式 MP4（frag mp4）。
+    要求系统有 ffmpeg 命令。
+    """
+    if not os.path.exists(path):
+        raise HTTPException(404, "file not found")
+
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", str(max(0.0, t)),
+        "-i", path,
+        "-c", "copy",
+        "-movflags", "+faststart+frag_keyframe+empty_moov",
+        "-f", "mp4", "-",
+    ]
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE)
+    except FileNotFoundError:
+        raise HTTPException(500, "ffmpeg not found; please install ffmpeg and ensure it's in PATH")
+    if not proc.stdout:
+        raise HTTPException(500, "ffmpeg no stdout")
+
+    def _cleanup():
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+    }
+    return StreamingResponse(proc.stdout, media_type="video/mp4", headers=headers, background=BackgroundTask(_cleanup))
 
 @app.get("/scenes")
 def scenes():
