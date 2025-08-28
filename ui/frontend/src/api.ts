@@ -54,3 +54,18 @@ export async function listCandidates(
     items: any[]
   }
 }
+
+export async function listOrigSegments(scene_id: number) {
+  const res = await api.get('/orig_segments', { params: { scene_id } })
+  return res.data as {
+    ok: boolean
+    scene_id: number
+    segments: Array<{
+      start: number
+      end: number
+      scene_id: number
+      seg_id: number
+      scene_seg_idx: number
+    }>
+  }
+}

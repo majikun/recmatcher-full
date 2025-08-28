@@ -381,6 +381,24 @@ def apply(req: ApplyBatchReq):
 def get_overrides():
     return {"ok": True, "path": str(_overrides_path()), "count": len(STATE.applied_changes or {}), "data": STATE.applied_changes}
 
+@app.get("/orig_segments")
+def get_orig_segments(scene_id: int = Query(...)):
+    """获取指定场景的原始段落列表"""
+    try:
+        orig_segs_path = Path(STATE.project_root or ".") / "orig_segs_2s.json"
+        if not orig_segs_path.exists():
+            raise HTTPException(404, "orig_segs_2s.json not found")
+        
+        with open(orig_segs_path, "r", encoding="utf-8") as f:
+            all_segs = json.load(f)
+        
+        # 过滤出指定场景的段落
+        scene_segs = [seg for seg in all_segs if seg.get("scene_id") == scene_id]
+        
+        return {"ok": True, "scene_id": scene_id, "segments": scene_segs}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load orig segments: {str(e)}")
+
 
 @app.post("/overrides/clear")
 def clear_overrides():

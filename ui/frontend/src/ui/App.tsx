@@ -1,7 +1,19 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react'
-import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene, listCandidates} from '../api'
+import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene, listCandidates, listOrigSegments} from '../api'
 
 const BACKEND_BASE = `${window.location.protocol}//${window.location.hostname}:8787`
+
+// 格式化时间为 时:分:秒.毫秒 格式
+function formatTime(seconds: number): string {
+  if (typeof seconds !== 'number' || isNaN(seconds)) return '0:00:00.000'
+  
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const secs = Math.floor(seconds % 60)
+  const milliseconds = Math.floor((seconds % 1) * 1000)
+  
+  return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`
+}
 
 type Scene = {clip_scene_id:number,count:number,avg_conf:number,chain_len:number}
 
@@ -30,6 +42,7 @@ export default function App(){
   const [scenes,setScenes]=useState<Scene[]>([])
   const [activeScene,setActiveScene]=useState<number|null>(null)
   const [segments,setSegments]=useState<SegmentRow[]>([])
+  const [allSegments,setAllSegments]=useState<SegmentRow[]>([])
   const [selectedSegId,setSelectedSegId]=useState<number|null>(null)
   const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
   const [followMovie,setFollowMovie]=useState<boolean>(true)
@@ -37,6 +50,8 @@ export default function App(){
   const [mirrorClip, setMirrorClip] = useState<boolean>(false)
   const [candMode, setCandMode] = useState<'top'|'scene'|'all'>('top')
   const [candList, setCandList] = useState<any[]>([])
+  const [origSegments, setOrigSegments] = useState<any[]>([])
+  const [showOrigSegments, setShowOrigSegments] = useState<boolean>(false)
 
   const clipRef = useRef<HTMLVideoElement|null>(null)
   const movieRef = useRef<HTMLVideoElement|null>(null)
@@ -98,8 +113,21 @@ export default function App(){
     try {
       const arr: Scene[] = await listScenes()
       setScenes(arr)
-      if (arr && arr.length) {
-        setActiveScene(arr[0].clip_scene_id)
+      
+      // 加载所有场景的段落，按 seg_id 展开显示
+      const allSegs: SegmentRow[] = []
+      for (const scene of arr) {
+        try {
+          const segs = await listSegments(scene.clip_scene_id)
+          allSegs.push(...segs)
+        } catch (e) {
+          console.error(`Failed to load segments for scene ${scene.clip_scene_id}`, e)
+        }
+      }
+      setAllSegments(allSegs)
+      
+      if (allSegs && allSegs.length) {
+        setSelectedSegId(allSegs[0].seg_id)
       }
     } catch (e) {
       console.error('listScenes failed', e)
@@ -116,21 +144,27 @@ export default function App(){
     await refreshOverrides()
   }
 
-  // load segments when scene changes
+  // load segments when selection changes
   useEffect(()=>{
-    if(activeScene!=null){
-      listSegments(activeScene).then(arr=>{
-        setSegments(arr)
-        if (arr && arr.length){
-          setSelectedSegId(arr[0].seg_id)
-          setSelectedCandIdx(0)
-          loadCandidates(arr[0].seg_id, candMode)
-        } else {
-          setSelectedSegId(null)
+    if(selectedSegId != null){
+      // 当选择了 seg_id 时，从 allSegments 中找到对应的段落
+      const selectedSeg = allSegments.find(s => s.seg_id === selectedSegId)
+      if (selectedSeg) {
+        // 设置当前活动场景为该段落所属的场景
+        setActiveScene(selectedSeg.clip.scene_id || null)
+        
+        // 加载该场景的所有段落
+        if (selectedSeg.clip.scene_id != null) {
+          listSegments(selectedSeg.clip.scene_id).then(arr=>{
+            setSegments(arr)
+            loadCandidates(selectedSegId, candMode)
+          }).catch(e => {
+            console.error('Failed to load segments', e)
+          })
         }
-      })
+      }
     }
-  },[activeScene])
+  },[selectedSegId, allSegments])
 
   // fetch candidates for current seg
   async function loadCandidates(segId: number, mode: 'top'|'scene'|'all'){
@@ -141,7 +175,7 @@ export default function App(){
       setSelectedCandIdx(0)
     }catch(e){
       console.error('listCandidates failed', e)
-      const r = segments.find(s=>s.seg_id===segId)
+      const r = allSegments.find(s=>s.seg_id===segId) || segments.find(s=>s.seg_id===segId)
       setCandList(r?.top_matches || [])
       setSelectedCandIdx(0)
     }
@@ -151,10 +185,64 @@ export default function App(){
     if (selectedSegId!=null) loadCandidates(selectedSegId, candMode)
   }, [selectedSegId, candMode])
 
+  // 加载原始段落数据 (当前场景及前后场景)
+  async function loadOrigSegments(sceneId: number) {
+    try {
+      const promises = []
+      const sceneIds = []
+      
+      // 加载前两个场景
+      for (let i = sceneId - 2; i <= sceneId + 2; i++) {
+        if (i > 0) { // 只加载有效的场景ID
+          promises.push(listOrigSegments(i))
+          sceneIds.push(i)
+        }
+      }
+      
+      const responses = await Promise.all(promises)
+      
+      // 合并所有场景的segments，并添加场景标识
+      const allSegments = []
+      responses.forEach((resp, idx) => {
+        const segments = resp.segments || []
+        segments.forEach((seg: any) => {
+          allSegments.push({
+            ...seg,
+            _sceneId: sceneIds[idx], // 添加场景标识
+            _isCurrentScene: sceneIds[idx] === sceneId // 标识是否为当前场景
+          })
+        })
+      })
+      
+      // 按场景ID和segment索引排序
+      allSegments.sort((a, b) => {
+        if (a._sceneId !== b._sceneId) {
+          return a._sceneId - b._sceneId
+        }
+        return (a.scene_seg_idx || 0) - (b.scene_seg_idx || 0)
+      })
+      
+      setOrigSegments(allSegments)
+    } catch (e) {
+      console.error('Failed to load orig segments', e)
+      setOrigSegments([])
+    }
+  }
+
   // derive selected row
   const selectedRow: SegmentRow | undefined = useMemo(()=>{
-    return segments.find(s=>s.seg_id===selectedSegId)
-  },[segments,selectedSegId])
+    return allSegments.find(s=>s.seg_id===selectedSegId) || segments.find(s=>s.seg_id===selectedSegId)
+  },[allSegments, segments, selectedSegId])
+
+  // 当选择"场景内"模式时加载原始段落
+  useEffect(() => {
+    if (candMode === 'scene' && selectedRow?.matched_orig_seg?.scene_id) {
+      loadOrigSegments(selectedRow.matched_orig_seg.scene_id)
+      setShowOrigSegments(true)
+    } else {
+      setShowOrigSegments(false)
+    }
+  }, [candMode, selectedRow])
 
   function seekWhenReady(v: HTMLVideoElement | null, t: number){
     if (!v) return
@@ -237,6 +325,46 @@ export default function App(){
     attachLoopSafe(mv, movieLoopStart, movieLoopEnd, movieLoopHandlerRef, movieSeekingRef)
   }
 
+  // Seek to a specific original segment without affecting candidate state
+  function seekToOrigSegment(origSeg: any) {
+    if (!origSeg || !selectedRow) return
+    
+    const clipStart = selectedRow.clip.start ?? 0
+    const clipEnd = selectedRow.clip.end ?? (clipStart + 2)
+    const movStart = origSeg.start ?? 0
+    const movEnd = origSeg.end ?? (movStart + 2)
+    
+    dlog('seekToOrigSegment', { seg_id: origSeg.seg_id, clipStart, clipEnd, movStart, movEnd })
+
+    const cv = clipRef.current
+    const mv = movieRef.current
+
+    // Build URLs with explicit time start
+    const clipUrl = `${BACKEND_BASE}/video/clip?t=${clipStart.toFixed(3)}`
+    const movieUrl = `${BACKEND_BASE}/video/movie?t=${movStart.toFixed(3)}`
+    
+    setClipSrc(clipUrl)
+    setMovieSrc(movieUrl)
+
+    // For streams, loop bounds should be relative to 0
+    const clipLoopStart = 0
+    const clipLoopEnd = Math.max(0.01, (clipEnd - clipStart))
+    const movieLoopStart = 0
+    const movieLoopEnd = Math.max(0.01, (movEnd - movStart))
+
+    // Seek to start of streams (0 for ?t= streams)
+    seekWhenReady(cv, 0)
+    seekWhenReady(mv, 0)
+
+    // Optional autoplay
+    try { cv && cv.play().catch(()=>{}) } catch {}
+    try { mv && mv.play().catch(()=>{}) } catch {}
+
+    // Set up loop handlers
+    attachLoopSafe(cv, clipLoopStart, clipLoopEnd, clipLoopHandlerRef, clipSeekingRef)
+    attachLoopSafe(mv, movieLoopStart, movieLoopEnd, movieLoopHandlerRef, movieSeekingRef)
+  }
+
   // When selection or candidate selection changes, seek
   useEffect(()=>{ seekTo() },[selectedSegId, selectedCandIdx, followMovie, candList])
 
@@ -248,12 +376,16 @@ export default function App(){
     if (!cand) return
     await applyChanges([{ seg_id: r.seg_id, chosen: cand }])
     await refreshOverrides()
-    // reload and advance to next row
-    const arr = await listSegments(activeScene!)
-    setSegments(arr)
-    const idx = arr.findIndex(x=>x.seg_id===r.seg_id)
-    const next = idx>=0 && idx+1 < arr.length ? arr[idx+1].seg_id : r.seg_id
-    setSelectedSegId(next)
+    
+    // 重新加载所有段落数据
+    await refreshScenes()
+    
+    // 尝试选择下一个段落
+    const currentIdx = allSegments.findIndex(x=>x.seg_id===r.seg_id)
+    const nextIdx = currentIdx >= 0 && currentIdx + 1 < allSegments.length ? currentIdx + 1 : currentIdx
+    if (nextIdx >= 0 && allSegments[nextIdx]) {
+      setSelectedSegId(allSegments[nextIdx].seg_id)
+    }
     setSelectedCandIdx(0)
   }
 
@@ -261,8 +393,9 @@ export default function App(){
   async function doRebuild(){
     if (activeScene==null) return
     await rebuildScene(activeScene)
-    const arr = await listSegments(activeScene)
-    setSegments(arr)
+    
+    // 重新加载所有数据
+    await refreshScenes()
     await refreshOverrides()
   }
 
@@ -283,26 +416,43 @@ export default function App(){
     </div>
 
     <div className='main'>
-      <div className='panel'>
-        <div style={{fontWeight:600,marginBottom:6}}>Clip 场景</div>
-        <div className='scene-list'>
-          {Array.isArray(scenes) && scenes.length===0 && (
-            <div style={{fontSize:12,opacity:.7,padding:'8px 4px'}}>无场景数据：检查项目根目录是否包含 match_segments.json / scene_out.json；或点击“刷新场景”。</div>
+            <div className='panel'>
+        <div style={{fontWeight:600,marginBottom:6}}>段落列表</div>
+        <div className='scene-list' style={{maxHeight: '400px', overflowY: 'auto'}}>
+          {Array.isArray(allSegments) && allSegments.length===0 && (
+            <div style={{fontSize:12,opacity:.7,padding:'8px 4px'}}>无段落数据</div>
           )}
-          {Array.isArray(scenes) && scenes.map((s:Scene)=>(
-            <div key={s.clip_scene_id}
-                 className={'scene-item '+(activeScene===s.clip_scene_id?'active':'')}
-                 onClick={()=>setActiveScene(s.clip_scene_id)}
-                 onMouseEnter={()=>ensureSceneHint(s.clip_scene_id)}>
-              <div>#{s.clip_scene_id}</div>
-              <div className='badge'>{s.count} / len {s.chain_len}</div>
-              <div className='badge' style={{marginLeft:8, opacity: sceneHints[s.clip_scene_id]===undefined? .5 : 1}}>
-                {sceneHints[s.clip_scene_id]
-                  ? `S${sceneHints[s.clip_scene_id]!.scene_id}:${sceneHints[s.clip_scene_id]!.scene_seg_idx}`
-                  : '…'}
+          {Array.isArray(allSegments) && allSegments.map((seg:SegmentRow)=>{
+            const mo = seg.matched_orig_seg || {}
+            const clipSceneId = seg.clip.scene_id
+            const origSegId = mo.seg_id
+            const hasOverride = overrides?.data && overrides.data[seg.seg_id]
+            
+            return (
+              <div key={seg.seg_id}
+                   className={'scene-item '+(selectedSegId===seg.seg_id?'active':'')}
+                   onClick={()=>setSelectedSegId(seg.seg_id)}
+                   style={{
+                     padding: '6px 12px', 
+                     cursor: 'pointer',
+                     backgroundColor: hasOverride ? 'rgba(64, 158, 255, 0.1)' : 'transparent'
+                   }}>
+                <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                  <div style={{fontWeight:600, fontSize:14}}>
+                    #{seg.seg_id} {clipSceneId}
+                  </div>
+                  {hasOverride && (
+                    <div style={{fontSize:12, color:'#409eff'}}>
+                      ✓
+                    </div>
+                  )}
+                </div>
+                <div style={{fontSize:11, opacity:0.7, marginTop:2}}>
+                  → orig {origSegId || '-'}
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
 
@@ -365,19 +515,113 @@ export default function App(){
         </div>
         {!selectedRow && <div style={{fontSize:12,opacity:.7}}>选中一行以查看候选</div>}
         {selectedRow && <div>
-          {(candList||[]).slice(0,50).map((c:any,i:number)=>{
-            const on = i===selectedCandIdx
-            return <div key={i} className='candidate'
-                        style={{borderColor:on?'#409eff':'#eee', background:on?'#f5fbff':'#fff'}}
-                        onClick={()=>{ setSelectedCandIdx(i); seekTo(selectedRow,i) }}>
-              <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
-                <div>scene {c.scene_id} / idx {c.scene_seg_idx}</div>
-                <div style={{fontWeight:600}}>{(c.score??0).toFixed?.(3) ?? c.score}</div>
+          {showOrigSegments && candMode === 'scene' ? (
+            // 显示原始段落列表 (按场景分组)
+            <div>
+              <div style={{fontSize:12, opacity:.7, marginBottom:8}}>
+                场景 {selectedRow.matched_orig_seg?.scene_id} 及前后场景的段落 (共 {origSegments.length} 个)
               </div>
-              <div style={{fontSize:12,opacity:.7}}>t {c.start?.toFixed?.(2) ?? c.start} - {c.end?.toFixed?.(2) ?? c.end}</div>
-              <div style={{fontSize:12,opacity:.6, marginTop:2}}>src: {c.source || '-'}</div>
+              <div style={{
+                maxHeight: '400px',
+                overflowY: 'auto',
+                border: '1px solid #eee',
+                borderRadius: '4px',
+                padding: '8px',
+                marginBottom: '12px'
+              }}>
+                {(() => {
+                  // 按场景ID分组
+                  const sceneGroups = new Map()
+                  origSegments.forEach(seg => {
+                    const sceneId = seg._sceneId
+                    if (!sceneGroups.has(sceneId)) {
+                      sceneGroups.set(sceneId, [])
+                    }
+                    sceneGroups.get(sceneId).push(seg)
+                  })
+                  
+                  return Array.from(sceneGroups.entries()).map(([sceneId, segments]) => (
+                    <div key={sceneId} style={{marginBottom: 16}}>
+                      <div style={{
+                        fontSize: 13, 
+                        fontWeight: 600, 
+                        marginBottom: 8,
+                        color: segments[0]?._isCurrentScene ? '#409eff' : '#666',
+                        borderBottom: '1px solid #eee',
+                        paddingBottom: 4
+                      }}>
+                        场景 {sceneId} {segments[0]?._isCurrentScene ? '(当前)' : ''} - {segments.length} 个段落
+                      </div>
+                      {segments.map((origSeg: any, i: number) => {
+                        // 检查这个原始段落是否在当前候选列表中
+                        const isCandidate = candList.some(c => 
+                          c.seg_id === origSeg.seg_id && c.scene_id === origSeg.scene_id
+                        )
+                        const isSelected = candList[selectedCandIdx]?.seg_id === origSeg.seg_id
+                        
+                        return (
+                          <div key={`${sceneId}-${i}`} 
+                               className='candidate'
+                               style={{
+                                 borderColor: isSelected ? '#409eff' : isCandidate ? '#67c23a' : '#eee',
+                                 background: isSelected ? '#f5fbff' : isCandidate ? '#f0f9ff' : '#fff',
+                                 opacity: origSeg._isCurrentScene ? (isCandidate ? 1 : 0.8) : (isCandidate ? 1 : 0.4),
+                                 cursor: 'pointer',
+                                 marginBottom: 4
+                               }}
+                               onClick={() => {
+                                 if (isCandidate) {
+                                   // 如果是候选项，按原有逻辑处理
+                                   const candIdx = candList.findIndex(c => c.seg_id === origSeg.seg_id)
+                                   if (candIdx >= 0) {
+                                     setSelectedCandIdx(candIdx)
+                                     seekTo(selectedRow, candIdx)
+                                   }
+                                 } else {
+                                   // 如果不是候选项，使用独立的播放函数
+                                   seekToOrigSegment(origSeg)
+                                 }
+                               }}>
+                            <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                              <div>
+                                seg {origSeg.seg_id} / idx {origSeg.scene_seg_idx}
+                                {isCandidate && <span style={{color:'#67c23a', marginLeft:8}}>✓ 候选</span>}
+                                {!origSeg._isCurrentScene && <span style={{color:'#999', marginLeft:8, fontSize:11}}>其他场景</span>}
+                              </div>
+                              <div style={{fontWeight:600}}>
+                                {isCandidate ? 
+                                  (candList.find(c => c.seg_id === origSeg.seg_id)?.score?.toFixed?.(3) ?? '-') 
+                                  : '-'
+                                }
+                              </div>
+                            </div>
+                            <div style={{fontSize:12,opacity:.7}}>
+                              {formatTime(origSeg.start ?? 0)} - {formatTime(origSeg.end ?? 0)}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ))
+                })()}
+              </div>
             </div>
-          })}
+          ) : (
+            // 原有的候选项列表
+            (candList||[]).slice(0,50).map((c:any,i:number)=>{
+              const on = i===selectedCandIdx
+              return <div key={i} className='candidate'
+                          style={{borderColor:on?'#409eff':'#eee', background:on?'#f5fbff':'#fff'}}
+                          onClick={()=>{ setSelectedCandIdx(i); seekTo(selectedRow,i) }}>
+                <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                  <div>scene {c.scene_id} / idx {c.scene_seg_idx}</div>
+                  <div style={{fontWeight:600}}>{(c.score??0).toFixed?.(3) ?? c.score}</div>
+                </div>
+                <div style={{fontSize:12,opacity:.7}}>{formatTime(c.start ?? 0)} - {formatTime(c.end ?? 0)}</div>
+                <div style={{fontSize:12,opacity:.6, marginTop:2}}>src: {c.source || '-'}</div>
+              </div>
+            })
+          )}
           <div style={{display:'flex', gap:8}}>
             <button onClick={acceptSelected}>应用所选</button>
             <button onClick={()=>{ setSelectedCandIdx(0); seekTo(selectedRow,0) }}>选第一个</button>
