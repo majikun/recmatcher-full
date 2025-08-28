@@ -15,15 +15,21 @@ export default function App(){
   const [allSegments,setAllSegments]=useState<SegmentRow[]>([])
   const [selectedSegId,setSelectedSegId]=useState<number|null>(null)
   const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
-  // 当前准备应用的候选（可能来自右侧候选列表，也可能来自“场景内原片段”面板）
+  // 当前准备应用的候选（可能来自右侧候选列表，也可能来自“场景内原片段/走廊”面板）
   const [pendingChoice, setPendingChoice] = useState<{type:'cand'|'orig', data:any} | null>(null)
   const [followMovie,setFollowMovie]=useState<boolean>(true)
   const [loop,setLoop]=useState<boolean>(true)
   const [mirrorClip, setMirrorClip] = useState<boolean>(false)
-  const [candMode, setCandMode] = useState<'top'|'scene'|'all'>('top')
+  const [candMode, setCandMode] = useState<'top'|'scene'|'all'|'corridor'>('top')
   const { items: candList, total: candTotal } = useCandidates(selectedSegId, candMode, 120)
   const [origSegments, setOrigSegments] = useState<any[]>([])
   const [showOrigSegments, setShowOrigSegments] = useState<boolean>(false)
+
+  // 走廊（前/后 clip 场景锚点相邻原片场景）
+  const [corridorPrev, setCorridorPrev] = useState<any[]>([])
+  const [corridorNext, setCorridorNext] = useState<any[]>([])
+  const corridorCacheRef = useRef(new Map<number, any[]>())
+  const CORRIDOR_N = 2 // 默认展示相邻 2 个场景
 
   const clipRef = useRef<HTMLVideoElement|null>(null)
   const movieRef = useRef<HTMLVideoElement|null>(null)
@@ -230,6 +236,28 @@ export default function App(){
     }
   }
 
+  // 加载走廊：以锚点 scene_id 为基准，prev=向后取、next=向前取相邻原片场景
+  async function loadCorridorFor(anchorSceneId: number, dir: 'prev'|'next', n = CORRIDOR_N){
+    const ids: number[] = []
+    if (dir === 'prev'){
+      for (let s = anchorSceneId + 1; s <= anchorSceneId + n; s++) ids.push(s)
+    } else {
+      for (let s = anchorSceneId - n; s <= anchorSceneId - 1; s++) if (s > 0) ids.push(s)
+    }
+    const all: any[] = []
+    for (const sid of ids){
+      if (!corridorCacheRef.current.has(sid)){
+        try{
+          const resp = await listOrigSegments(sid)
+          const arr = (resp?.segments || []).map((x:any)=>({ ...x, _sceneId: sid, _corridor: dir }))
+          corridorCacheRef.current.set(sid, arr)
+        }catch(e){ console.error('loadCorridorFor failed', e); corridorCacheRef.current.set(sid, []) }
+      }
+      all.push(...(corridorCacheRef.current.get(sid) || []))
+    }
+    if (dir==='prev') setCorridorPrev(all); else setCorridorNext(all)
+  }
+
   // derive selected row
   const selectedRow: SegmentRow | undefined = useMemo(()=>{
     return allSegments.find(s=>s.seg_id===selectedSegId) || segments.find(s=>s.seg_id===selectedSegId)
@@ -244,6 +272,36 @@ export default function App(){
       setShowOrigSegments(false)
     }
   }, [candMode, selectedRow])
+
+  // 当选择变化时，基于前/后 clip 场景的原片锚点，加载走廊
+  useEffect(()=>{
+    if (!selectedRow) return
+    const cid = selectedRow.clip?.scene_id
+    if (cid == null) return
+
+    // 取所有 clip 场景 id，去重排序
+    const sceneIds = Array.from(new Set(allSegments.map(s=>s.clip?.scene_id).filter((x:any)=>x!=null))).sort((a:any,b:any)=>a-b)
+    const idx = sceneIds.indexOf(cid)
+    const prevCid = idx>0 ? sceneIds[idx-1] : null
+    const nextCid = (idx>=0 && idx<sceneIds.length-1) ? sceneIds[idx+1] : null
+
+    // 从 sceneHints 或首行匹配里取锚点原片 scene_id
+    const anchorFromClipScene = (clipSceneId:number|null)=>{
+      if (!clipSceneId) return null
+      const hint = sceneHints[clipSceneId]
+      if (hint?.scene_id != null) return hint.scene_id
+      const firstRow = allSegments.find(s=>s.clip?.scene_id===clipSceneId)
+      const mo:any = firstRow?.matched_orig_seg || firstRow?.top_matches?.[0]
+      return mo?.scene_id ?? null
+    }
+
+    const anchorPrev = anchorFromClipScene(prevCid)
+    const anchorNext = anchorFromClipScene(nextCid)
+
+    setCorridorPrev([]); setCorridorNext([])
+    if (anchorPrev) loadCorridorFor(anchorPrev, 'prev', CORRIDOR_N)
+    if (anchorNext) loadCorridorFor(anchorNext, 'next', CORRIDOR_N)
+  }, [selectedRow, allSegments, sceneHints])
 
   // Seek videos to the currently selected row (clip uses clip times, movie uses current choice/candidate)
   function seekTo(row?: SegmentRow, candIdx?: number){
@@ -316,7 +374,7 @@ export default function App(){
     const r = selectedRow
     if (!r) { console.warn('[apply] no selected row'); return }
 
-    // 优先使用 pendingChoice（可能来自场景内原片段）；其次回退到当前候选列表；再回退 row.top_matches
+    // 优先使用 pendingChoice（可能来自场景内原片段/走廊）；其次回退到当前候选列表；再回退 row.top_matches
     const fromPending = pendingChoice?.data
     const fromCandList = (candList && candList[selectedCandIdx]) || null
     const fromRowTop = (r.top_matches && r.top_matches[selectedCandIdx]) || null
@@ -380,7 +438,7 @@ export default function App(){
     </div>
 
     <div className='main'>
-            <div className='panel'>
+      <div className='panel'>
         <div style={{fontWeight:600,marginBottom:6}}>段落列表</div>
         <div className='scene-list' style={{maxHeight: '400px', overflowY: 'auto'}}>
           {Array.isArray(allSegments) && allSegments.length===0 && (
@@ -473,13 +531,9 @@ export default function App(){
                      //if (!syncPlay) setIsPlaying(false)
                    }}
                    onSeeking={e=>{ 
-                     //clipSeekingRef.current = true
-                     // if (syncPlay && !movieSeekingRef.current) {
-                     //   handleSeek(e.currentTarget.currentTime, true)
-                     // }
                      if (debug) console.log('[Clip] seeking to', e.currentTarget.currentTime) 
                    }}
-                   onSeeked={e=>{ /*clipSeekingRef.current = false;*/ if (debug) console.log('[Clip] seeked to', e.currentTarget.currentTime) }}
+                   onSeeked={e=>{ if (debug) console.log('[Clip] seeked to', e.currentTarget.currentTime) }}
                    onError={e=>{ console.error('[Clip] error', e) }}
             />
             {syncPlay && selectedRow && (
@@ -529,13 +583,9 @@ export default function App(){
                      //if (!syncPlay) setIsPlaying(false)
                    }}
                    onSeeking={e=>{ 
-                     //movieSeekingRef.current = true
-                     // if (syncPlay && !clipSeekingRef.current) {
-                     //   handleSeek(e.currentTarget.currentTime, false)
-                     // }
                      if (debug) console.log('[Movie] seeking to', e.currentTarget.currentTime) 
                    }}
-                   onSeeked={e=>{ /*movieSeekingRef.current = false;*/ if (debug) console.log('[Movie] seeked to', e.currentTarget.currentTime) }}
+                   onSeeked={e=>{ if (debug) console.log('[Movie] seeked to', e.currentTarget.currentTime) }}
                    onError={e=>{ console.error('[Movie] error', e) }}
             />
             {syncPlay && selectedRow && (
@@ -629,11 +679,11 @@ export default function App(){
         <div style={{display:'flex',alignItems:'center',marginBottom:6}}>
           <div style={{fontWeight:600}}>候选（当前段）</div>
           <div style={{marginLeft:12, display:'flex', gap:8}}>
-            {(['top','scene','all'] as const).map(md=>(
+            {(['top','scene','corridor','all'] as const).map(md=>(
               <button key={md}
                       onClick={()=>setCandMode(md)}
                       style={{padding:'4px 8px', border:'1px solid #ddd', borderRadius:4, background: candMode===md?'#eef6ff':'#fff'}}>
-                {md==='top'?'Top': md==='scene'?'场景内':'全部'}
+                {md==='top'?'Top': md==='scene'?'场景内': md==='corridor'?'走廊':'全部'}
               </button>
             ))}
           </div>
@@ -642,7 +692,7 @@ export default function App(){
         {!selectedRow && <div style={{fontSize:12,opacity:.7}}>选中一行以查看候选</div>}
         {selectedRow && <div>
           {showOrigSegments && candMode === 'scene' ? (
-            // 显示原始段落列表 (按场景分组)
+            // === 场景内 ===
             <div>
               <div style={{fontSize:12, opacity:.7, marginBottom:8}}>
                 场景 {selectedRow.matched_orig_seg?.scene_id} 及前后场景的段落 (共 {origSegments.length} 个)
@@ -761,8 +811,89 @@ export default function App(){
                 })()}
               </div>
             </div>
+          ) : candMode === 'corridor' ? (
+            // === 走廊 ===
+            <div>
+              <div style={{fontSize:12, opacity:.7, marginBottom:8}}>
+                基于 clip 前后场景锚点，展示相邻原片场景（±{CORRIDOR_N}）
+              </div>
+
+              {/* 前序走廊 */}
+              <div style={{fontSize:13, fontWeight:600, margin:'12px 0 8px'}}>← 前序走廊</div>
+              <div style={{maxHeight: 200, overflowY: 'auto', border: '1px solid #eee', borderRadius: 4, padding: 8, marginBottom: 12}}>
+                {corridorPrev.length===0 && <div style={{fontSize:12, opacity:.6}}>无数据</div>}
+                {corridorPrev.map((origSeg:any, i:number)=>{
+                  const isCandidate = candList.some(c => c.seg_id===origSeg.seg_id && c.scene_id===origSeg.scene_id)
+                  const isSelected = candList[selectedCandIdx]?.seg_id === origSeg.seg_id
+                  const isPlaying = playingType === 'orig' && playingOrigSegId === origSeg.seg_id
+                  let borderColor = '#eee', backgroundColor = '#fff'
+                  if (isPlaying){ borderColor = '#ff6b35'; backgroundColor = '#fff5f2' }
+                  else if (isSelected){ borderColor = '#409eff'; backgroundColor = '#f5fbff' }
+                  else if (isCandidate){ borderColor = '#67c23a'; backgroundColor = '#f0f9ff' }
+                  return (
+                    <div key={`prev-${i}`} className='candidate' style={{borderColor, background: backgroundColor, marginBottom:4, cursor:'pointer'}}
+                         onClick={()=>{
+                           if (isCandidate){
+                             const candIdx = candList.findIndex(c => c.seg_id===origSeg.seg_id && c.scene_id===origSeg.scene_id)
+                             if (candIdx>=0) seekToCandidate(candList[candIdx], candIdx); else seekToOrigSegment(origSeg)
+                           }else{ seekToOrigSegment(origSeg) }
+                         }}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                        <div style={{ fontWeight: isPlaying ? 'bold' : 'normal', color: isPlaying ? '#ff6b35' : '#333' }}>
+                          {isPlaying && <span style={{ marginRight: 4 }}>▶</span>}
+                          seg {origSeg.seg_id} / idx {origSeg.scene_seg_idx}
+                          {isCandidate && <span style={{color:'#67c23a', marginLeft:8}}>✓ 候选</span>}
+                          <span style={{color:'#999', marginLeft:8, fontSize:11}}>S{origSeg._sceneId}</span>
+                        </div>
+                        <div style={{fontWeight:600}}>{isCandidate ? (candList.find(c => c.seg_id===origSeg.seg_id)?.score?.toFixed?.(3) ?? '-') : '-'}</div>
+                      </div>
+                      <div style={{fontSize:12, opacity: isPlaying?1:.7, fontWeight: isPlaying?'bold':'normal', color: isPlaying?'#ff6b35':'inherit'}}>
+                        {formatTime(origSeg.start ?? 0)} - {formatTime(origSeg.end ?? 0)}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* 后续走廊 */}
+              <div style={{fontSize:13, fontWeight:600, margin:'12px 0 8px'}}>后续走廊 →</div>
+              <div style={{maxHeight: 200, overflowY: 'auto', border: '1px solid #eee', borderRadius: 4, padding: 8}}>
+                {corridorNext.length===0 && <div style={{fontSize:12, opacity:.6}}>无数据</div>}
+                {corridorNext.map((origSeg:any, i:number)=>{
+                  const isCandidate = candList.some(c => c.seg_id===origSeg.seg_id && c.scene_id===origSeg.scene_id)
+                  const isSelected = candList[selectedCandIdx]?.seg_id === origSeg.seg_id
+                  const isPlaying = playingType === 'orig' && playingOrigSegId === origSeg.seg_id
+                  let borderColor = '#eee', backgroundColor = '#fff'
+                  if (isPlaying){ borderColor = '#ff6b35'; backgroundColor = '#fff5f2' }
+                  else if (isSelected){ borderColor = '#409eff'; backgroundColor = '#f5fbff' }
+                  else if (isCandidate){ borderColor = '#67c23a'; backgroundColor = '#f0f9ff' }
+                  return (
+                    <div key={`next-${i}`} className='candidate' style={{borderColor, background: backgroundColor, marginBottom:4, cursor:'pointer'}}
+                         onClick={()=>{
+                           if (isCandidate){
+                             const candIdx = candList.findIndex(c => c.seg_id===origSeg.seg_id && c.scene_id===origSeg.scene_id)
+                             if (candIdx>=0) seekToCandidate(candList[candIdx], candIdx); else seekToOrigSegment(origSeg)
+                           }else{ seekToOrigSegment(origSeg) }
+                         }}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                        <div style={{ fontWeight: isPlaying ? 'bold' : 'normal', color: isPlaying ? '#ff6b35' : '#333' }}>
+                          {isPlaying && <span style={{ marginRight: 4 }}>▶</span>}
+                          seg {origSeg.seg_id} / idx {origSeg.scene_seg_idx}
+                          {isCandidate && <span style={{color:'#67c23a', marginLeft:8}}>✓ 候选</span>}
+                          <span style={{color:'#999', marginLeft:8, fontSize:11}}>S{origSeg._sceneId}</span>
+                        </div>
+                        <div style={{fontWeight:600}}>{isCandidate ? (candList.find(c => c.seg_id===origSeg.seg_id)?.score?.toFixed?.(3) ?? '-') : '-'}</div>
+                      </div>
+                      <div style={{fontSize:12, opacity: isPlaying?1:.7, fontWeight: isPlaying?'bold':'normal', color: isPlaying?'#ff6b35':'inherit'}}>
+                        {formatTime(origSeg.start ?? 0)} - {formatTime(origSeg.end ?? 0)}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
           ) : (
-            // 原有的候选项列表
+            // === 其他：候选列表 ===
             (candList||[]).slice(0,50).map((c:any,i:number)=>{
               const isSelected = i===selectedCandIdx
               // 修正播放状态检测：简化逻辑，只检查选中状态和播放类型
@@ -814,14 +945,12 @@ export default function App(){
             <button onClick={acceptSelected}>应用所选</button>
             <button onClick={()=>{ 
               if (candMode === 'scene' && origSegments.length > 0) {
-                // 在场景模式下，播放第一个原始段落
                 const firstOrigSeg = origSegments[0]
-                if (firstOrigSeg) {
-                  setSelectedCandIdx(0)
-                  seekToOrigSegment(firstOrigSeg)
-                }
+                if (firstOrigSeg) { setSelectedCandIdx(0); seekToOrigSegment(firstOrigSeg) }
+              } else if (candMode === 'corridor') {
+                const first = corridorPrev[0] || corridorNext[0]
+                if (first) { setSelectedCandIdx(0); seekToOrigSegment(first) }
               } else if (candList && candList.length > 0) {
-                // 在其他模式下，播放第一个候选项
                 seekToCandidate(candList[0], 0)
               }
             }}>选第一个</button>
