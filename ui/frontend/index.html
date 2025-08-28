@@ -1,0 +1,18 @@
+<!doctype html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recmatcher UI</title>
+<style>
+html,body,#root{height:100%;margin:0} .layout{display:grid;grid-template-rows:auto 1fr;height:100%;font-family:system-ui,Arial}
+.toolbar{padding:8px;border-bottom:1px solid #ddd;display:flex;gap:8px;align-items:center}
+.main{display:grid;grid-template-columns:260px 1fr 320px;gap:8px;padding:8px}
+.panel{border:1px solid #eee;border-radius:8px;padding:8px;overflow:hidden}
+.scene-list{overflow:auto;height:calc(100vh - 120px)}
+.scene-item{display:flex;justify-content:space-between;padding:6px 8px;cursor:pointer;border-radius:6px}
+.scene-item.active{background:#f0f7ff}
+.videos{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.videos video{width:100%;height:260px;background:#000}
+.seg-table{width:100%;border-collapse:collapse;font-size:13px}
+.seg-table th,.seg-table td{border-bottom:1px solid #eee;padding:6px 4px}
+.badge{font-size:11px;padding:2px 6px;border-radius:10px;background:#eee}
+</style>
+</head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
