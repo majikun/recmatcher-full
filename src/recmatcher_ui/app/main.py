@@ -11,6 +11,48 @@ from .utils import group_by_clip_scene
 from pathlib import Path
 import json
 
+# --- overrides sidecar helpers -------------------------------------------------
+
+def _overrides_path() -> Path:
+    root = Path(STATE.project_root or ".")
+    return root / "match_overrides.json"
+
+
+def _load_overrides_into_state() -> None:
+    """Load sidecar overrides into STATE.applied_changes (id -> chosen dict)."""
+    p = _overrides_path()
+    applied: dict[int, dict] = {}
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    try:
+                        applied[int(k)] = v
+                    except Exception:
+                        pass
+            elif isinstance(raw, list):  # legacy list format: [{"seg_id":.., "chosen":..}]
+                for it in raw:
+                    sid = it.get("seg_id")
+                    if isinstance(sid, int):
+                        applied[sid] = it.get("chosen")
+        except Exception:
+            applied = {}
+    STATE.applied_changes = applied
+
+
+def _save_overrides_from_state() -> Path:
+    """Persist STATE.applied_changes to sidecar file. Returns the path."""
+    p = _overrides_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    out_obj = {str(k): v for k, v in (STATE.applied_changes or {}).items()}
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out_obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+    return p
+
 app = FastAPI(title="Recmatcher UI Backend", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -57,6 +99,7 @@ def open_project(req: OpenProjectReq):
         raise HTTPException(404, "root not found")
     STATE.load_project(req.root, req.movie_path, req.clip_path)
     STATE.build_explain_offsets()
+    _load_overrides_into_state()
     scenes = _scenes_summary()
     return {"ok": True, "scenes": scenes, "paths": STATE.paths}
 
@@ -141,7 +184,24 @@ def apply(req: ApplyBatchReq):
     for ch in req.changes:
         if isinstance(ch.seg_id, int):
             STATE.applied_changes[ch.seg_id] = ch.chosen
-    return {"ok": True, "applied": len(req.changes)}
+    sidecar = _save_overrides_from_state()
+    return {"ok": True, "applied": len(req.changes), "sidecar": str(sidecar)}
+
+@app.get("/overrides")
+def get_overrides():
+    return {"ok": True, "path": str(_overrides_path()), "count": len(STATE.applied_changes or {}), "data": STATE.applied_changes}
+
+
+@app.post("/overrides/clear")
+def clear_overrides():
+    STATE.applied_changes = {}
+    p = _overrides_path()
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    return {"ok": True}
 
 @app.post("/save")
 def save(req: SaveReq):

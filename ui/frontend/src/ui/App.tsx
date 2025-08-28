@@ -34,6 +34,7 @@ export default function App(){
   const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
   const [followMovie,setFollowMovie]=useState<boolean>(true)
   const [loop,setLoop]=useState<boolean>(true)
+  const [mirrorClip, setMirrorClip] = useState<boolean>(false)
 
   const clipRef = useRef<HTMLVideoElement|null>(null)
   const movieRef = useRef<HTMLVideoElement|null>(null)
@@ -142,23 +143,34 @@ export default function App(){
     const cv = clipRef.current
     const mv = movieRef.current
 
-    // Force start-at-time via Media Fragments to improve reliability across browsers/proxies
-    setClipSrc(`${BACKEND_BASE}/video/clip?t=${clipStart.toFixed(3)}`)
+    // Build URLs with explicit time start; streams start from 0 on the browser timeline
+    const clipUrl = `${BACKEND_BASE}/video/clip?t=${clipStart.toFixed(3)}`
+    let movieUrl = movieSrc
+    let movieIsStream = movieSrc.includes('?t=')
     if (followMovie) {
-      setMovieSrc(`${BACKEND_BASE}/video/movie?t=${movStart.toFixed(3)}`)
+      movieUrl = `${BACKEND_BASE}/video/movie?t=${movStart.toFixed(3)}`
+      movieIsStream = true
     }
+    setClipSrc(clipUrl)
+    setMovieSrc(movieUrl)
 
-    // seek (wait for metadata if needed)
-    seekWhenReady(cv, clipStart)
-    seekWhenReady(mv, movStart)
+    // When using ?t= streams, the currentTime origin is 0; loop bounds should be relative
+    const clipLoopStart = 0
+    const clipLoopEnd = Math.max(0.01, (clipEnd - clipStart))
+    const movieLoopStart = movieIsStream ? 0 : movStart
+    const movieLoopEnd = movieIsStream ? Math.max(0.01, (movEnd - movStart)) : movEnd
+
+    // seek (wait for metadata if needed). For streams, seek to 0; for full files, seek to absolute time
+    seekWhenReady(cv, 0)
+    seekWhenReady(mv, movieIsStream ? 0 : movStart)
 
     // optional autoplay (best-effort)
     try { cv && cv.play().catch(()=>{}) } catch {}
     try { mv && mv.play().catch(()=>{}) } catch {}
 
     // loop handlers with cleanup
-    attachLoopSafe(cv, clipStart, clipEnd, clipLoopHandlerRef, clipSeekingRef)
-    attachLoopSafe(mv, movStart, movEnd, movieLoopHandlerRef, movieSeekingRef)
+    attachLoopSafe(cv, clipLoopStart, clipLoopEnd, clipLoopHandlerRef, clipSeekingRef)
+    attachLoopSafe(mv, movieLoopStart, movieLoopEnd, movieLoopHandlerRef, movieSeekingRef)
   }
 
   // When selection or candidate selection changes, seek
@@ -196,6 +208,7 @@ export default function App(){
       <button onClick={doOpen}>打开</button><button onClick={refreshScenes}>刷新场景</button><div style={{flex:1}}/>
       <label style={{marginRight:12}}><input type='checkbox' checked={followMovie} onChange={e=>setFollowMovie(e.target.checked)} /> 跟随Movie候选</label>
       <label style={{marginRight:12}}><input type='checkbox' checked={loop} onChange={e=>setLoop(e.target.checked)} /> 循环当前段</label>
+      <label style={{marginRight:12}}><input type='checkbox' checked={mirrorClip} onChange={e=>setMirrorClip(e.target.checked)} /> 镜像Clip</label>
       <label style={{marginRight:12}}><input type='checkbox' checked={debug} onChange={e=>setDebug(e.target.checked)} /> 调试日志</label>
       <button onClick={doRebuild}>场景内重建</button>
       <button onClick={()=>save()}>保存导出</button>
@@ -222,6 +235,7 @@ export default function App(){
       <div className='panel'>
         <div className='videos'>
           <div><div style={{fontSize:12,opacity:.7,marginBottom:4}}>Clip</div><video preload="metadata" ref={clipRef} src={clipSrc} controls
+                 style={{ transform: mirrorClip ? 'scaleX(-1)' : undefined, transformOrigin: '50% 50%' }}
                  onLoadedMetadata={e=>{ const v=e.currentTarget as HTMLVideoElement; if (debug) console.log('[Clip] loadedmetadata dur=', v.duration) }}
                  onError={e=>{ console.error('[Clip] error', e) }}
                  onSeeking={e=>{ clipSeekingRef.current = true; if (debug) console.log('[Clip] seeking to', (e.currentTarget as HTMLVideoElement).currentTime) }}
