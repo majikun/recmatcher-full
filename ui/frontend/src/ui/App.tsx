@@ -1,43 +1,13 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react'
-import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene, listCandidates, listOrigSegments} from '../api'
+import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene, listOrigSegments} from '../api'
+import { formatTime, usePersistedState, useCandidates, usePlayerController, type Scene, type SegmentRow, type Candidate } from './logic'
 
 const BACKEND_BASE = `${window.location.protocol}//${window.location.hostname}:8787`
 
-// 格式化时间为 时:分:秒.毫秒 格式
-function formatTime(seconds: number): string {
-  if (typeof seconds !== 'number' || isNaN(seconds)) return '0:00:00.000'
-  
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  const secs = Math.floor(seconds % 60)
-  const milliseconds = Math.floor((seconds % 1) * 1000)
-  
-  return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`
-}
-
-type Scene = {clip_scene_id:number,count:number,avg_conf:number,chain_len:number}
-
-type SegmentRow = {
-  seg_id: number
-  clip: { scene_seg_idx?: number, start?: number, end?: number, scene_id?: number }
-  matched_orig_seg?: any
-  top_matches?: any[]
-}
-
 export default function App(){
-  const [root,setRoot]=useState(''); const [movie,setMovie]=useState(''); const [clip,setClip]=useState('')
-
-  // Load last inputs from localStorage on first render
-  useEffect(() => {
-    try {
-      const r = localStorage.getItem('rm_root');
-      const m = localStorage.getItem('rm_movie');
-      const c = localStorage.getItem('rm_clip');
-      if (r) setRoot(r);
-      if (m) setMovie(m);
-      if (c) setClip(c);
-    } catch {}
-  }, []);
+  const [root, setRoot]   = usePersistedState<string>('rm_root', '')
+  const [movie, setMovie] = usePersistedState<string>('rm_movie', '')
+  const [clip, setClip]   = usePersistedState<string>('rm_clip', '')
 
   const [scenes,setScenes]=useState<Scene[]>([])
   const [activeScene,setActiveScene]=useState<number|null>(null)
@@ -45,25 +15,24 @@ export default function App(){
   const [allSegments,setAllSegments]=useState<SegmentRow[]>([])
   const [selectedSegId,setSelectedSegId]=useState<number|null>(null)
   const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
+  // 当前准备应用的候选（可能来自右侧候选列表，也可能来自“场景内原片段”面板）
+  const [pendingChoice, setPendingChoice] = useState<{type:'cand'|'orig', data:any} | null>(null)
   const [followMovie,setFollowMovie]=useState<boolean>(true)
   const [loop,setLoop]=useState<boolean>(true)
   const [mirrorClip, setMirrorClip] = useState<boolean>(false)
   const [candMode, setCandMode] = useState<'top'|'scene'|'all'>('top')
-  const [candList, setCandList] = useState<any[]>([])
+  const { items: candList, total: candTotal } = useCandidates(selectedSegId, candMode, 120)
   const [origSegments, setOrigSegments] = useState<any[]>([])
   const [showOrigSegments, setShowOrigSegments] = useState<boolean>(false)
 
   const clipRef = useRef<HTMLVideoElement|null>(null)
   const movieRef = useRef<HTMLVideoElement|null>(null)
 
-  const clipLoopHandlerRef = useRef<any>(null)
-  const movieLoopHandlerRef = useRef<any>(null)
+  // player refs above
 
   const [debug, setDebug] = useState<boolean>(true)
   const clipLastLogRef = useRef<number>(0)
   const movieLastLogRef = useRef<number>(0)
-  const clipSeekingRef = useRef<boolean>(false)
-  const movieSeekingRef = useRef<boolean>(false)
   const dlog = (...args:any[]) => { if (debug) console.log('[UI]', ...args) }
 
   const [showDebugPanel, setShowDebugPanel] = useState<boolean>(true)
@@ -115,7 +84,18 @@ export default function App(){
   const [clipDuration, setClipDuration] = useState<number>(0)
   const [movieCurrentTime, setMovieCurrentTime] = useState<number>(0)
   const [movieDuration, setMovieDuration] = useState<number>(0)
-  const [isPlaying, setIsPlaying] = useState<boolean>(false)
+  // unified player controller
+  const [maxLoops, setMaxLoops] = useState<number>(3)
+  const { isPlaying, loopCount, range, playPair, play: playSync, pause: pauseSync, seekClipRel, seekMovieRel } =
+    usePlayerController({
+      clipRef,
+      movieRef,
+      backendBase: BACKEND_BASE,
+      syncPlay,
+      maxLoops,
+      debug,
+      onSetSrc: (cUrl, mUrl) => { setClipSrc(cUrl); setMovieSrc(mUrl) }
+    })
   
   // 当前播放的segment信息
   // 播放状态管理
@@ -139,15 +119,6 @@ export default function App(){
     sceneSegIdx?: number
   } | null>(null) // 记录当前正在校对的clip segment信息
   
-  // 循环播放计数管理
-  const [loopCount, setLoopCount] = useState<number>(0) // 当前已循环次数
-  const [maxLoops, setMaxLoops] = useState<number>(3) // 最大循环次数
-  const loopCountRef = useRef<number>(0) // 用于在事件处理器中访问最新的循环计数
-  
-  // 同步 loopCountRef 和 loopCount 状态
-  useEffect(() => {
-    loopCountRef.current = loopCount
-  }, [loopCount])
 
   async function refreshScenes(){
     try {
@@ -206,7 +177,7 @@ export default function App(){
         if (selectedSeg.clip.scene_id != null) {
           listSegments(selectedSeg.clip.scene_id).then(arr=>{
             setSegments(arr)
-            loadCandidates(selectedSegId, candMode)
+            // remove loadCandidates
           }).catch(e => {
             console.error('Failed to load segments', e)
           })
@@ -214,25 +185,6 @@ export default function App(){
       }
     }
   },[selectedSegId, allSegments])
-
-  // fetch candidates for current seg
-  async function loadCandidates(segId: number, mode: 'top'|'scene'|'all'){
-    try{
-      const resp = await listCandidates(segId, mode, 50, 0)
-      const items = resp?.items || []
-      setCandList(items)
-      setSelectedCandIdx(0)
-    }catch(e){
-      console.error('listCandidates failed', e)
-      const r = allSegments.find(s=>s.seg_id===segId) || segments.find(s=>s.seg_id===segId)
-      setCandList(r?.top_matches || [])
-      setSelectedCandIdx(0)
-    }
-  }
-
-  useEffect(()=>{
-    if (selectedSegId!=null) loadCandidates(selectedSegId, candMode)
-  }, [selectedSegId, candMode])
 
   // 加载原始段落数据 (当前场景及前后场景)
   async function loadOrigSegments(sceneId: number) {
@@ -293,314 +245,67 @@ export default function App(){
     }
   }, [candMode, selectedRow])
 
-  function seekWhenReady(v: HTMLVideoElement | null, t: number){
-    if (!v) return
-    const doSeek = () => { try { v.currentTime = Math.max(t, 0); dlog('set currentTime', t, 'ready=', v.readyState) } catch {} }
-    if (v.readyState >= 1) {
-      doSeek()
-    } else {
-      dlog('wait loadedmetadata before seek to', t)
-      const onMeta = () => { v.removeEventListener('loadedmetadata', onMeta); doSeek() }
-      v.addEventListener('loadedmetadata', onMeta)
-    }
-  }
-
-  function attachLoopSafe(v: HTMLVideoElement | null, s: number, e: number, ref: React.MutableRefObject<any>, seekingRef: React.MutableRefObject<boolean>){
-    if (!v) return
-    if (ref.current) {
-      v.removeEventListener('timeupdate', ref.current)
-      ref.current = null
-    }
-    const handler = () => {
-      if (!loop) return
-      if (seekingRef?.current) return
-      const span = e - s
-      if (span > 0.05 && v.currentTime > e - 0.03) {
-        // 检查是否达到最大循环次数
-        if (loopCountRef.current >= maxLoops) {
-          // 达到最大循环次数，停止播放
-          try { 
-            v.pause()
-          } catch {}
-          return
-        }
-        
-        // 继续循环并增加计数
-        try { 
-          v.currentTime = s 
-          loopCountRef.current += 1
-          setLoopCount(loopCountRef.current)
-        } catch {}
-      }
-    }
-    v.addEventListener('timeupdate', handler)
-    ref.current = handler
-  }
-
-  // 统一的播放控制函数
-  function playSegment(segmentData: {
-    segId: number,
-    clipStart: number,
-    clipEnd: number,
-    movieStart: number,
-    movieEnd: number,
-    fromSide: 'left' | 'right',
-    type: 'clip' | 'orig',
-    origSegId?: number  // 可选的原始segment ID
-  }) {
-    const { segId, clipStart, clipEnd, movieStart, movieEnd, fromSide, type, origSegId } = segmentData
-    
-    dlog('playSegment', { segId, clipStart, clipEnd, movieStart, movieEnd, fromSide, type, origSegId })
-
-    const cv = clipRef.current
-    const mv = movieRef.current
-
-    // Build URLs with explicit time start
-    const clipUrl = `${BACKEND_BASE}/video/clip?t=${clipStart.toFixed(3)}`
-    const movieUrl = `${BACKEND_BASE}/video/movie?t=${movieStart.toFixed(3)}`
-    
-    setClipSrc(clipUrl)
-    setMovieSrc(movieUrl)
-
-    // For streams, loop bounds should be relative to 0
-    const clipLoopStart = 0
-    const clipLoopEnd = Math.max(0.01, (clipEnd - clipStart))
-    const movieLoopStart = 0
-    const movieLoopEnd = Math.max(0.01, (movieEnd - movieStart))
-
-    // Seek to start of streams (0 for ?t= streams)
-    seekWhenReady(cv, 0)
-    seekWhenReady(mv, 0)
-
-    // Set up loop handlers
-    attachLoopSafe(cv, clipLoopStart, clipLoopEnd, clipLoopHandlerRef, clipSeekingRef)
-    attachLoopSafe(mv, movieLoopStart, movieLoopEnd, movieLoopHandlerRef, movieSeekingRef)
-    
-    // 更新播放状态
-    setPlayingSegId(segId)
-    setPlayingFromSide(fromSide)
-    setPlayingType(type)
-    
-    // 如果有原始segment ID，设置它
-    if (origSegId !== undefined) {
-      setPlayingOrigSegId(origSegId)
-    } else {
-      setPlayingOrigSegId(null)
-    }
-    
-    setCurrentPlayingTimeRange({
-      clipStart,
-      clipEnd,
-      movieStart,
-      movieEnd
-    })
-    
-    // 重置循环计数
-    setLoopCount(0)
-    loopCountRef.current = 0
-    
-    // 播放控制
-    if (syncPlay) {
-      // 在同步模式下，使用统一的播放控制
-      setTimeout(() => {
-        handlePlay()
-      }, 100)
-    } else {
-      // 非同步模式，独立播放
-      const tryPlay = (video: HTMLVideoElement | null) => {
-        if (!video) return
-        const attemptPlay = () => {
-          try { 
-            video.play().catch(()=>{})
-          } catch {}
-        }
-        
-        if (video.readyState >= 3) { // HAVE_FUTURE_DATA
-          attemptPlay()
-        } else {
-          const onCanPlay = () => {
-            video.removeEventListener('canplay', onCanPlay)
-            attemptPlay()
-          }
-          video.addEventListener('canplay', onCanPlay)
-          // Fallback timeout
-          setTimeout(attemptPlay, 300)
-        }
-      }
-      
-      tryPlay(cv)
-      tryPlay(mv)
-    }
-  }
-
   // Seek videos to the currently selected row (clip uses clip times, movie uses current choice/candidate)
   function seekTo(row?: SegmentRow, candIdx?: number){
     const r = row || selectedRow
     if (!r) return
     const clipStart = r.clip.start ?? 0
-    const clipEnd = r.clip.end ?? (clipStart + 2)
-    // candidate or current matched selection
-    let mo = r.matched_orig_seg || {}
-    const cand = (candList && candList[candIdx ?? selectedCandIdx]) ||
-                 ((r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null)
-    if (followMovie){
-      if (cand) mo = cand
-    }
+    const clipEnd   = r.clip.end   ?? (clipStart + 2)
+    let mo: any = r.matched_orig_seg || {}
+    const cand = (candList && candList[candIdx ?? selectedCandIdx]) || ((r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null)
+    if (followMovie && cand) mo = cand
     const movStart = mo?.start ?? 0
-    const movEnd = mo?.end ?? (movStart + 2)
-
-    playSegment({
-      segId: r.seg_id,
-      clipStart,
-      clipEnd,
-      movieStart: movStart,
-      movieEnd: movEnd,
-      fromSide: 'left',
-      type: 'clip'
-    })
+    const movEnd   = mo?.end   ?? (movStart + 2)
+    playPair(clipStart, clipEnd, movStart, movEnd)
+    // 更新播放态用于高亮
+    setPlayingSegId(r.seg_id)
+    setPlayingFromSide('left')
+    setPlayingType('clip')
+    setPlayingOrigSegId(mo?.seg_id ?? null)
+    // 维护当前校对段信息（供右侧使用）
+    setCurrentClipSegment({ segId: r.seg_id, clipStart, clipEnd, sceneId: r.clip.scene_id, sceneSegIdx: r.clip.scene_seg_idx })
   }
 
-  // Seek to a specific original segment without affecting candidate state
   function seekToOrigSegment(origSeg: any) {
     if (!origSeg || !currentClipSegment) return
-    
-    // 对于场景内的segments，左侧应该播放当前校对的clip segment
-    // 而不是寻找对应的clip segment
     const clipStart = currentClipSegment.clipStart
-    const clipEnd = currentClipSegment.clipEnd
-    
-    const movStart = origSeg.start ?? 0
-    const movEnd = origSeg.end ?? (movStart + 2)
-    
-    playSegment({
-      segId: currentClipSegment.segId, // 使用当前校对的clip segment ID，而不是origSeg.seg_id
-      clipStart,
-      clipEnd,
-      movieStart: movStart,
-      movieEnd: movEnd,
-      fromSide: 'right',
-      type: 'orig',
-      origSegId: origSeg.seg_id  // 传递原始segment ID
-    })
+    const clipEnd   = currentClipSegment.clipEnd
+    const movStart  = origSeg.start ?? 0
+    const movEnd    = origSeg.end   ?? (movStart + 2)
+    playPair(clipStart, clipEnd, movStart, movEnd)
+    setPlayingSegId(currentClipSegment.segId)
+    setPlayingFromSide('right')
+    setPlayingType('orig')
+    setPlayingOrigSegId(origSeg.seg_id ?? null)
+    // 将原片段映射为 candidate-like 数据，便于 apply 使用
+    const mapped = {
+      seg_id: origSeg.seg_id,
+      scene_seg_idx: origSeg.scene_seg_idx,
+      start: origSeg.start,
+      end: origSeg.end,
+      scene_id: origSeg.scene_id,
+      score: origSeg.score ?? 0,
+      faiss_id: origSeg.faiss_id ?? undefined,
+      movie_id: 'movie',
+      shot_id: -1,
+      source: origSeg.source ?? 'scene'
+    }
+    setPendingChoice({ type: 'orig', data: mapped })
   }
 
-  // 专门用于右侧候选项列表的播放
   function seekToCandidate(candidate: any, candIdx: number) {
     if (!currentClipSegment || !candidate) return
-    
-    // 使用当前校对的clip segment信息
     const clipStart = currentClipSegment.clipStart
-    const clipEnd = currentClipSegment.clipEnd
-    
-    // 使用候选项的movie信息
-    const movStart = candidate.start ?? 0
-    const movEnd = candidate.end ?? (movStart + 2)
-    
-    // 更新候选项选择状态
+    const clipEnd   = currentClipSegment.clipEnd
+    const movStart  = candidate.start ?? 0
+    const movEnd    = candidate.end   ?? (movStart + 2)
     setSelectedCandIdx(candIdx)
-    
-    playSegment({
-      segId: currentClipSegment.segId, // 使用当前校对的clip segment ID
-      clipStart,
-      clipEnd,
-      movieStart: movStart,
-      movieEnd: movEnd,
-      fromSide: 'right',
-      type: 'clip'
-    })
-  }
-
-  // 同步播放控制函数
-  function handlePlay() {
-    const cv = clipRef.current
-    const mv = movieRef.current
-    
-    if (syncPlay && cv && mv) {
-      // 确保两个视频都准备好了再同步播放
-      const playWhenReady = async () => {
-        // 等待两个视频都有足够的数据
-        const waitForReady = (video: HTMLVideoElement) => {
-          return new Promise<void>((resolve) => {
-            if (video.readyState >= 3) { // HAVE_FUTURE_DATA
-              resolve()
-            } else {
-              const onCanPlay = () => {
-                video.removeEventListener('canplay', onCanPlay)
-                resolve()
-              }
-              video.addEventListener('canplay', onCanPlay)
-            }
-          })
-        }
-        
-        try {
-          // 等待两个视频都准备好
-          await Promise.all([waitForReady(cv), waitForReady(mv)])
-          
-          // 同时开始播放
-          await Promise.all([
-            cv.play().catch(()=>{}),
-            mv.play().catch(()=>{})
-          ])
-          
-          setIsPlaying(true)
-        } catch (e) {
-          console.error('Failed to sync play:', e)
-          // 降级到普通播放
-          cv.play().catch(()=>{})
-          mv.play().catch(()=>{})
-          setIsPlaying(true)
-        }
-      }
-      
-      playWhenReady()
-    } else if (cv || mv) {
-      // 非同步模式，直接播放
-      cv?.play().catch(()=>{})
-      mv?.play().catch(()=>{})
-      setIsPlaying(true)
-    }
-  }
-
-  function handlePause() {
-    const cv = clipRef.current
-    const mv = movieRef.current
-    if (syncPlay && cv && mv) {
-      // 同时暂停
-      cv.pause()
-      mv.pause()
-    } else {
-      cv?.pause()
-      mv?.pause()
-    }
-    setIsPlaying(false)
-  }
-
-  function handleSeek(time: number, isClip: boolean) {
-    if (!syncPlay) return
-    
-    const cv = clipRef.current
-    const mv = movieRef.current
-    
-    if (isClip && cv && mv) {
-      // 从clip进度条拖拽，同步到movie
-      const clipProgress = clipDuration > 0 ? time / clipDuration : 0
-      const movieTime = clipProgress * movieDuration
-      try {
-        if (movieTime >= 0 && movieTime <= movieDuration) {
-          mv.currentTime = movieTime
-        }
-      } catch {}
-    } else if (!isClip && cv && mv) {
-      // 从movie进度条拖拽，同步到clip
-      const movieProgress = movieDuration > 0 ? time / movieDuration : 0
-      const clipTime = movieProgress * clipDuration
-      try {
-        if (clipTime >= 0 && clipTime <= clipDuration) {
-          cv.currentTime = clipTime
-        }
-      } catch {}
-    }
+    setPendingChoice({ type: 'cand', data: candidate })
+    playPair(clipStart, clipEnd, movStart, movEnd)
+    setPlayingSegId(currentClipSegment.segId)
+    setPlayingFromSide('right')
+    setPlayingType('clip')
+    setPlayingOrigSegId(candidate.seg_id ?? null)
   }
 
   // When selection or candidate selection changes, seek
@@ -609,22 +314,32 @@ export default function App(){
   // Accept selected candidate for selected row
   async function acceptSelected(){
     const r = selectedRow
-    if (!r) return
-    const cand = (candList && candList[selectedCandIdx]) || (r.top_matches && r.top_matches[selectedCandIdx]) || null
-    if (!cand) return
-    await applyChanges([{ seg_id: r.seg_id, chosen: cand }])
-    await refreshOverrides()
-    
-    // 重新加载所有段落数据
-    await refreshScenes()
-    
-    // 尝试选择下一个段落
-    const currentIdx = allSegments.findIndex(x=>x.seg_id===r.seg_id)
-    const nextIdx = currentIdx >= 0 && currentIdx + 1 < allSegments.length ? currentIdx + 1 : currentIdx
-    if (nextIdx >= 0 && allSegments[nextIdx]) {
-      setSelectedSegId(allSegments[nextIdx].seg_id)
+    if (!r) { console.warn('[apply] no selected row'); return }
+
+    // 优先使用 pendingChoice（可能来自场景内原片段）；其次回退到当前候选列表；再回退 row.top_matches
+    const fromPending = pendingChoice?.data
+    const fromCandList = (candList && candList[selectedCandIdx]) || null
+    const fromRowTop = (r.top_matches && r.top_matches[selectedCandIdx]) || null
+    const chosen = fromPending || fromCandList || fromRowTop
+
+    if (!chosen){ console.warn('[apply] no candidate to apply'); return }
+
+    const change = { seg_id: r.seg_id, chosen }
+
+    try{
+      console.log('[apply] sending change', change)
+      await applyChanges([change])
+
+      // 本地乐观更新：更新中间表（segments）里该行
+      setSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}}) : row) : prev)
+      // 也更新左侧 allSegments（段落列表）以保持一致
+      setAllSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}}) : row) : prev)
+
+      console.log('[apply] applied on seg', r.seg_id, '->', chosen)
+    } catch (e:any) {
+      console.error('[apply] failed', e)
+      alert('应用失败: ' + (e?.message || String(e)))
     }
-    setSelectedCandIdx(0)
   }
 
   // Scene level rebuild
@@ -639,9 +354,9 @@ export default function App(){
 
   return <div className='layout'>
     <div className='toolbar'>
-      <input style={{width:320}} placeholder='project root' value={root} onChange={e=>{ const v=e.target.value; setRoot(v); try{ localStorage.setItem('rm_root', v); }catch{} }} />
-      <input style={{width:260}} placeholder='movie.mp4 (optional)' value={movie} onChange={e=>{ const v=e.target.value; setMovie(v); try{ localStorage.setItem('rm_movie', v); }catch{} }} />
-      <input style={{width:260}} placeholder='clip.mp4 (optional)' value={clip} onChange={e=>{ const v=e.target.value; setClip(v); try{ localStorage.setItem('rm_clip', v); }catch{} }} />
+      <input style={{width:320}} placeholder='project root' value={root} onChange={e=>{ setRoot(e.target.value) }} />
+      <input style={{width:260}} placeholder='movie.mp4 (optional)' value={movie} onChange={e=>{ setMovie(e.target.value) }} />
+      <input style={{width:260}} placeholder='clip.mp4 (optional)' value={clip} onChange={e=>{ setClip(e.target.value) }} />
       <button onClick={doOpen}>打开</button><button onClick={refreshScenes}>刷新场景</button><div style={{flex:1}}/>
       <label style={{marginRight:12}}><input type='checkbox' checked={followMovie} onChange={e=>setFollowMovie(e.target.checked)} /> 跟随Movie候选</label>
       <label style={{marginRight:12}}><input type='checkbox' checked={loop} onChange={e=>setLoop(e.target.checked)} /> 循环当前段</label>
@@ -718,7 +433,7 @@ export default function App(){
       <div className='panel'>
         <div style={{marginBottom: 16}}>
           <div style={{display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8}}>
-            <button onClick={isPlaying ? handlePause : handlePlay}>
+            <button onClick={isPlaying ? pauseSync : playSync}>
               {isPlaying ? '⏸️ 暂停' : '▶️ 播放'}
             </button>
             <label style={{display: 'flex', alignItems: 'center', gap: 4}}>
@@ -752,34 +467,26 @@ export default function App(){
                      }
                    }}
                    onPlay={() => { 
-                     if (!syncPlay) setIsPlaying(true)
+                     //if (!syncPlay) setIsPlaying(true)
                    }}
                    onPause={() => { 
-                     if (!syncPlay) setIsPlaying(false)
+                     //if (!syncPlay) setIsPlaying(false)
                    }}
                    onSeeking={e=>{ 
-                     clipSeekingRef.current = true
-                     if (syncPlay && !movieSeekingRef.current) {
-                       handleSeek(e.currentTarget.currentTime, true)
-                     }
+                     //clipSeekingRef.current = true
+                     // if (syncPlay && !movieSeekingRef.current) {
+                     //   handleSeek(e.currentTarget.currentTime, true)
+                     // }
                      if (debug) console.log('[Clip] seeking to', e.currentTarget.currentTime) 
                    }}
-                   onSeeked={e=>{ clipSeekingRef.current = false; if (debug) console.log('[Clip] seeked to', e.currentTarget.currentTime) }}
+                   onSeeked={e=>{ /*clipSeekingRef.current = false;*/ if (debug) console.log('[Clip] seeked to', e.currentTarget.currentTime) }}
                    onError={e=>{ console.error('[Clip] error', e) }}
             />
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
                 <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
-                  {(() => {
-                    // 优先使用当前播放的时间范围，如果没有则使用默认逻辑
-                    if (currentPlayingTimeRange) {
-                      const { clipStart, clipEnd } = currentPlayingTimeRange
-                      return `${formatTime(clipStart + clipCurrentTime)} / ${formatTime(clipEnd)}`
-                    } else {
-                      // 降级到原有逻辑
-                      return `${formatTime((selectedRow.clip?.start ?? 0) + clipCurrentTime)} / ${formatTime(selectedRow.clip?.end ?? (selectedRow.clip?.start ?? 0) + clipDuration)}`
-                    }
-                  })()}
+                  { range ? `${formatTime(range.clipStart + clipCurrentTime)} / ${formatTime(range.clipEnd)}`
+                          : `${formatTime((selectedRow?.clip?.start ?? 0) + clipCurrentTime)} / ${formatTime(selectedRow?.clip?.end ?? (selectedRow?.clip?.start ?? 0) + clipDuration)}` }
                 </div>
                 <input
                   type="range"
@@ -788,11 +495,9 @@ export default function App(){
                   step={0.1}
                   value={clipCurrentTime}
                   onChange={(e) => {
-                    const time = parseFloat(e.target.value)
-                    if (clipRef.current) {
-                      clipRef.current.currentTime = time
-                      handleSeek(time, true)
-                    }
+                    const t = parseFloat(e.target.value)
+                    if (clipRef.current) clipRef.current.currentTime = t
+                    seekClipRel(t)
                   }}
                   style={{width: '100%'}}
                 />
@@ -818,37 +523,26 @@ export default function App(){
                      }
                    }}
                    onPlay={() => { 
-                     if (!syncPlay) setIsPlaying(true)
+                     //if (!syncPlay) setIsPlaying(true)
                    }}
                    onPause={() => { 
-                     if (!syncPlay) setIsPlaying(false)
+                     //if (!syncPlay) setIsPlaying(false)
                    }}
                    onSeeking={e=>{ 
-                     movieSeekingRef.current = true
-                     if (syncPlay && !clipSeekingRef.current) {
-                       handleSeek(e.currentTarget.currentTime, false)
-                     }
+                     //movieSeekingRef.current = true
+                     // if (syncPlay && !clipSeekingRef.current) {
+                     //   handleSeek(e.currentTarget.currentTime, false)
+                     // }
                      if (debug) console.log('[Movie] seeking to', e.currentTarget.currentTime) 
                    }}
-                   onSeeked={e=>{ movieSeekingRef.current = false; if (debug) console.log('[Movie] seeked to', e.currentTarget.currentTime) }}
+                   onSeeked={e=>{ /*movieSeekingRef.current = false;*/ if (debug) console.log('[Movie] seeked to', e.currentTarget.currentTime) }}
                    onError={e=>{ console.error('[Movie] error', e) }}
             />
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
                 <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
-                  {(() => {
-                    // 优先使用当前播放的时间范围，如果没有则使用默认逻辑
-                    if (currentPlayingTimeRange) {
-                      const { movieStart, movieEnd } = currentPlayingTimeRange
-                      return `${formatTime(movieStart + movieCurrentTime)} / ${formatTime(movieEnd)}`
-                    } else {
-                      // 降级到原有逻辑
-                      const mo = selectedRow.matched_orig_seg || (candList && candList[selectedCandIdx])
-                      const movieStart = mo?.start ?? 0
-                      const movieEnd = mo?.end ?? (movieStart + movieDuration)
-                      return `${formatTime(movieStart + movieCurrentTime)} / ${formatTime(movieEnd)}`
-                    }
-                  })()}
+                  { range ? `${formatTime(range.movieStart + movieCurrentTime)} / ${formatTime(range.movieEnd)}`
+                          : (()=>{ const mo = selectedRow?.matched_orig_seg || (candList && candList[selectedCandIdx]); const ms=mo?.start??0; const me=mo?.end??(ms+movieDuration); return `${formatTime(ms + movieCurrentTime)} / ${formatTime(me)}` })() }
                 </div>
                 <input
                   type="range"
@@ -857,11 +551,9 @@ export default function App(){
                   step={0.1}
                   value={movieCurrentTime}
                   onChange={(e) => {
-                    const time = parseFloat(e.target.value)
-                    if (movieRef.current) {
-                      movieRef.current.currentTime = time
-                      handleSeek(time, false)
-                    }
+                    const t = parseFloat(e.target.value)
+                    if (movieRef.current) movieRef.current.currentTime = t
+                    seekMovieRel(t)
                   }}
                   style={{width: '100%'}}
                 />
@@ -904,6 +596,7 @@ export default function App(){
                          onClick={()=>{ 
                            setSelectedSegId(s.seg_id); 
                            setSelectedCandIdx(0); 
+                           setPendingChoice(null);
                            // 更新当前校对的clip segment信息
                            setCurrentClipSegment({
                              segId: s.seg_id,
@@ -944,7 +637,7 @@ export default function App(){
               </button>
             ))}
           </div>
-          <div style={{marginLeft:'auto', fontSize:12, opacity:.7}}>共 {candList?.length ?? 0} 条（展示前 50）</div>
+          <div style={{marginLeft:'auto', fontSize:12, opacity:.7}}>共 {candTotal ?? (candList?.length ?? 0)} 条（展示前 50）</div>
         </div>
         {!selectedRow && <div style={{fontSize:12,opacity:.7}}>选中一行以查看候选</div>}
         {selectedRow && <div>
