@@ -253,8 +253,10 @@ export function usePlayerController(opts: PlayerOpts){
     if (syncPlay){
       const mv = movieRef.current
       if (mv && range){
-        const ratio = (cv.duration>0? tRel/cv.duration : 0)
-        const t2 = ratio * (mv.duration || 0)
+        const clipLen = Math.max(0.01, (range.clipEnd - range.clipStart))
+        const movieLen = Math.max(0.01, (range.movieEnd - range.movieStart))
+        const ratio = Math.max(0, Math.min(1, tRel / clipLen))
+        const t2 = ratio * movieLen
         try { mv.currentTime = t2 } catch {}
       }
     }
@@ -267,8 +269,10 @@ export function usePlayerController(opts: PlayerOpts){
     if (syncPlay){
       const cv = clipRef.current
       if (cv && range){
-        const ratio = (mv.duration>0? tRel/mv.duration : 0)
-        const t2 = ratio * (cv.duration || 0)
+        const clipLen = Math.max(0.01, (range.clipEnd - range.clipStart))
+        const movieLen = Math.max(0.01, (range.movieEnd - range.movieStart))
+        const ratio = Math.max(0, Math.min(1, tRel / movieLen))
+        const t2 = ratio * clipLen
         try { cv.currentTime = t2 } catch {}
       }
     }

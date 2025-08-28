@@ -605,7 +605,7 @@ export default function App(){
                 <input
                   type="range"
                   min={0}
-                  max={clipDuration || 1}
+                  max={range ? Math.max(0.01, range.clipEnd - range.clipStart) : (clipDuration || 1)}
                   step={0.1}
                   value={clipCurrentTime}
                   onChange={(e) => {
@@ -667,7 +667,7 @@ export default function App(){
                 <input
                   type="range"
                   min={0}
-                  max={movieDuration || 1}
+                  max={range ? Math.max(0.01, range.movieEnd - range.movieStart) : (movieDuration || 1)}
                   step={0.1}
                   value={movieCurrentTime}
                   onChange={(e) => {
