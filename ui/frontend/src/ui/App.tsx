@@ -52,13 +52,6 @@ export default function App(){
     return d[segId] ?? d[String(segId)] ?? null
   }
 
-  // 将 seg 的 matched_orig_seg 与 override 合并，优先取 override 字段（保留以备他处使用）
-  const getMergedMatchForSeg = (seg: SegmentRow) => {
-    const ov: any = getOverrideForSeg(seg.seg_id)
-    const base = (seg as any).matched_orig_seg || null
-    return ov ? ({ ...(base||{}), ...ov }) : (base || null)
-  }
-
   async function refreshOverrides(){
     try{
       const resp = await fetch(`${BACKEND_BASE}/overrides`)

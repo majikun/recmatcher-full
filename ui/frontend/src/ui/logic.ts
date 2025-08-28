@@ -119,6 +119,8 @@ export function usePlayerController(opts: PlayerOpts){
 
   const clipHandlerRef = useRef<(this: HTMLVideoElement, ev: Event)=>any | null>(null)
   const movieHandlerRef = useRef<(this: HTMLVideoElement, ev: Event)=>any | null>(null)
+  const endedClipRef = useRef(false)
+  const endedMovieRef = useRef(false)
 
   // 清理事件
   const detach = useCallback(()=>{
@@ -141,21 +143,45 @@ export function usePlayerController(opts: PlayerOpts){
 
   const attachLoop = (v: HTMLVideoElement | null, s: number, e: number, side: 'clip'|'movie')=>{
     if (!v) return
+    const EPS = 0.03
+    const HOLD = 0.02 // 当本侧先到达末尾时，停在末尾附近等待另一侧
+    const len = Math.max(0.01, e - s)
     const handler = ()=>{
       if (!range) return
-      if (e - s > 0.05 && v.currentTime > e - 0.03){
-        // 到段尾：循环上限控制
-        setLoopCount(prev=>{
-          const next = prev + 1
-          if (next >= maxLoops){
-            try { v.pause() } catch {}
-            if (syncPlay){ try { (side==='clip' ? movieRef.current : clipRef.current)?.pause() } catch {} }
-            return next
-          }
-          try { v.currentTime = s } catch {}
-          return next
-        })
+      // 仅在区间播放时生效
+      const atEnd = v.currentTime >= Math.max(0.01, len) - EPS
+      if (!atEnd) return
+
+      if (side === 'clip') endedClipRef.current = true
+      else endedMovieRef.current = true
+
+      const otherEnded = side === 'clip' ? endedMovieRef.current : endedClipRef.current
+
+      // 本侧先到：先停住并卡在末尾，等待另一侧
+      if (!otherEnded) {
+        try { v.pause() } catch {}
+        try { v.currentTime = Math.max(0, len - HOLD) } catch {}
+        return
       }
+
+      // 两侧都到达末尾：统一做一次循环控制
+      setLoopCount(prev => {
+        const next = prev + 1
+        if (next >= maxLoops) {
+          try { clipRef.current?.pause() } catch {}
+          try { movieRef.current?.pause() } catch {}
+          return next
+        }
+        // 从头一起开始
+        try { clipRef.current && (clipRef.current.currentTime = 0) } catch {}
+        try { movieRef.current && (movieRef.current.currentTime = 0) } catch {}
+        // 清标志并继续播放
+        endedClipRef.current = false
+        endedMovieRef.current = false
+        try { clipRef.current?.play() } catch {}
+        try { movieRef.current?.play() } catch {}
+        return next
+      })
     }
     v.addEventListener('timeupdate', handler)
     return handler
@@ -166,6 +192,9 @@ export function usePlayerController(opts: PlayerOpts){
     const cv = clipRef.current, mv = movieRef.current
     setRange({ clipStart, clipEnd, movieStart, movieEnd })
     setLoopCount(0)
+    // 重置结束标志
+    endedClipRef.current = false
+    endedMovieRef.current = false
     // 构造后端流URL：?t=xxx
     const clipUrl = `${backendBase}/video/clip?t=${clipStart.toFixed(3)}`
     const movieUrl = `${backendBase}/video/movie?t=${movieStart.toFixed(3)}`
