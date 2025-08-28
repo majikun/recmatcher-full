@@ -1,5 +1,5 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react'
-import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene} from '../api'
+import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene, listCandidates} from '../api'
 
 const BACKEND_BASE = `${window.location.protocol}//${window.location.hostname}:8787`
 
@@ -35,6 +35,8 @@ export default function App(){
   const [followMovie,setFollowMovie]=useState<boolean>(true)
   const [loop,setLoop]=useState<boolean>(true)
   const [mirrorClip, setMirrorClip] = useState<boolean>(false)
+  const [candMode, setCandMode] = useState<'top'|'scene'|'all'>('top')
+  const [candList, setCandList] = useState<any[]>([])
 
   const clipRef = useRef<HTMLVideoElement|null>(null)
   const movieRef = useRef<HTMLVideoElement|null>(null)
@@ -122,12 +124,32 @@ export default function App(){
         if (arr && arr.length){
           setSelectedSegId(arr[0].seg_id)
           setSelectedCandIdx(0)
+          loadCandidates(arr[0].seg_id, candMode)
         } else {
           setSelectedSegId(null)
         }
       })
     }
   },[activeScene])
+
+  // fetch candidates for current seg
+  async function loadCandidates(segId: number, mode: 'top'|'scene'|'all'){
+    try{
+      const resp = await listCandidates(segId, mode, 50, 0)
+      const items = resp?.items || []
+      setCandList(items)
+      setSelectedCandIdx(0)
+    }catch(e){
+      console.error('listCandidates failed', e)
+      const r = segments.find(s=>s.seg_id===segId)
+      setCandList(r?.top_matches || [])
+      setSelectedCandIdx(0)
+    }
+  }
+
+  useEffect(()=>{
+    if (selectedSegId!=null) loadCandidates(selectedSegId, candMode)
+  }, [selectedSegId, candMode])
 
   // derive selected row
   const selectedRow: SegmentRow | undefined = useMemo(()=>{
@@ -172,7 +194,8 @@ export default function App(){
     const clipEnd = r.clip.end ?? (clipStart + 2)
     // candidate or current matched selection
     let mo = r.matched_orig_seg || {}
-    const cand = (r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null
+    const cand = (candList && candList[candIdx ?? selectedCandIdx]) ||
+                 ((r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null)
     if (followMovie){
       if (cand) mo = cand
     }
@@ -215,13 +238,13 @@ export default function App(){
   }
 
   // When selection or candidate selection changes, seek
-  useEffect(()=>{ seekTo() },[selectedSegId, selectedCandIdx, followMovie])
+  useEffect(()=>{ seekTo() },[selectedSegId, selectedCandIdx, followMovie, candList])
 
   // Accept selected candidate for selected row
   async function acceptSelected(){
     const r = selectedRow
     if (!r) return
-    const cand = (r.top_matches && r.top_matches[selectedCandIdx]) || null
+    const cand = (candList && candList[selectedCandIdx]) || (r.top_matches && r.top_matches[selectedCandIdx]) || null
     if (!cand) return
     await applyChanges([{ seg_id: r.seg_id, chosen: cand }])
     await refreshOverrides()
@@ -327,24 +350,37 @@ export default function App(){
       </div>
 
       <div className='panel'>
-        <div style={{fontWeight:600,marginBottom:6}}>候选（当前段）</div>
+        <div style={{display:'flex',alignItems:'center',marginBottom:6}}>
+          <div style={{fontWeight:600}}>候选（当前段）</div>
+          <div style={{marginLeft:12, display:'flex', gap:8}}>
+            {(['top','scene','all'] as const).map(md=>(
+              <button key={md}
+                      onClick={()=>setCandMode(md)}
+                      style={{padding:'4px 8px', border:'1px solid #ddd', borderRadius:4, background: candMode===md?'#eef6ff':'#fff'}}>
+                {md==='top'?'Top': md==='scene'?'场景内':'全部'}
+              </button>
+            ))}
+          </div>
+          <div style={{marginLeft:'auto', fontSize:12, opacity:.7}}>共 {candList?.length ?? 0} 条（展示前 50）</div>
+        </div>
         {!selectedRow && <div style={{fontSize:12,opacity:.7}}>选中一行以查看候选</div>}
         {selectedRow && <div>
-          {(selectedRow.top_matches||[]).slice(0,9).map((c:any,i:number)=>{
+          {(candList||[]).slice(0,50).map((c:any,i:number)=>{
             const on = i===selectedCandIdx
             return <div key={i} className='candidate'
                         style={{borderColor:on?'#409eff':'#eee', background:on?'#f5fbff':'#fff'}}
                         onClick={()=>{ setSelectedCandIdx(i); seekTo(selectedRow,i) }}>
               <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
                 <div>scene {c.scene_id} / idx {c.scene_seg_idx}</div>
-                <div style={{fontWeight:600}}>{(c.score??0).toFixed(3)}</div>
+                <div style={{fontWeight:600}}>{(c.score??0).toFixed?.(3) ?? c.score}</div>
               </div>
               <div style={{fontSize:12,opacity:.7}}>t {c.start?.toFixed?.(2) ?? c.start} - {c.end?.toFixed?.(2) ?? c.end}</div>
+              <div style={{fontSize:12,opacity:.6, marginTop:2}}>src: {c.source || '-'}</div>
             </div>
           })}
           <div style={{display:'flex', gap:8}}>
             <button onClick={acceptSelected}>应用所选</button>
-            <button onClick={()=>{ setSelectedCandIdx(0); seekTo(selectedRow,0) }}>选Top1</button>
+            <button onClick={()=>{ setSelectedCandIdx(0); seekTo(selectedRow,0) }}>选第一个</button>
           </div>
         </div>}
       </div>

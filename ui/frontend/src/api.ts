@@ -37,3 +37,20 @@ export async function save(out_path?: string) {
   const res = await api.post('/save', { out_path })
   return res.data
 }
+
+// --- candidates ---------------------------------------------------------------
+export async function listCandidates(
+  seg_id: number,
+  mode: 'top' | 'scene' | 'all' = 'top',
+  k = 50,
+  offset = 0
+) {
+  const res = await api.get('/candidates', { params: { seg_id, mode, k, offset } })
+  return res.data as {
+    ok: boolean
+    seg_id: number
+    mode: string
+    total: number
+    items: any[]
+  }
+}

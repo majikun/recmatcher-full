@@ -159,6 +159,196 @@ def stream_mp4_from_time(path: str, t: float):
     }
     return StreamingResponse(proc.stdout, media_type="video/mp4", headers=headers, background=BackgroundTask(_cleanup))
 
+# --- candidates: expose richer options for a given seg_id ---------------------
+
+def _normalize_cand(x: dict) -> dict:
+    """Best-effort normalize candidate dict to expected keys.
+    Accepts varied shapes from explain; returns a shallow copy.
+    """
+    if not isinstance(x, dict):
+        return x
+    it = dict(x)
+    # common aliasing
+    if "idx" in it and "scene_seg_idx" not in it:
+        it["scene_seg_idx"] = it.get("idx")
+    if "seg_idx" in it and "scene_seg_idx" not in it:
+        it["scene_seg_idx"] = it.get("seg_idx")
+    # sometimes nested under 'orig' / 'movie'
+    m = it.get("orig") or it.get("movie") or {}
+    for k in ("scene_id", "scene_seg_idx", "start", "end", "faiss_id"):
+        if it.get(k) is None and isinstance(m, dict) and m.get(k) is not None:
+            it[k] = m.get(k)
+    # sometimes score under other name
+    if it.get("score") is None:
+        for sk in ("rerank", "sim", "s", "prob"):
+            if it.get(sk) is not None:
+                it["score"] = it.get(sk)
+                break
+    return it
+
+def _read_explain_slow(seg_id: int):
+    """Fallback: linearly scan a jsonl explain file to find the record for seg_id.
+    Tries multiple likely locations based on STATE.paths / project_root.
+    """
+    candidates = []
+    try:
+        p = None
+        # try explicit path from STATE.paths if present
+        try:
+            p = (getattr(STATE, "paths", {}) or {}).get("explain")
+        except Exception:
+            p = None
+        paths = []
+        if p:
+            paths.append(Path(p))
+        # common fallbacks
+        pr = Path(STATE.project_root or ".")
+        for name in ("match_explain.jsonl", "match_explain.json", "explain.jsonl"):
+            paths.append(pr / name)
+        for path in paths:
+            try:
+                if not path or not path.exists():
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        sid = obj.get("seg_id") or obj.get("clip_seg_id") or obj.get("id")
+                        try:
+                            if sid is not None and int(sid) == int(seg_id):
+                                return obj
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+def _get_explain_candidates(seg_id: int) -> list[dict]:
+    """Read rich candidates from explain jsonl via STATE (if available)."""
+    try:
+        # STATE.read_explain may raise if offsets not built
+        obj = getattr(STATE, "read_explain", None)
+        if callable(obj):
+            rec = obj(int(seg_id))
+        else:
+            rec = None  # will try slow scan below
+    except Exception:
+        rec = None  # will try slow scan below
+    if not rec:
+        # slow-path scan when offsets are not available
+        rec = _read_explain_slow(seg_id)
+    items: list[dict] = []
+    if isinstance(rec, dict):
+        # try common keys (prefer post-processed, then pre-processed)
+        for key in ("candidates_post", "candidates_pre", "top_matches", "candidates", "topk", "items"):
+            arr = rec.get(key)
+            if isinstance(arr, list) and arr:
+                items = arr
+                break
+        # fallback: whole record is a candidate list
+        if not items and "scene_id" in rec:
+            items = [rec]
+    elif isinstance(rec, list):
+        items = rec
+    # normalize
+    out: list[dict] = []
+    for it in items:
+        if isinstance(it, dict):
+            out.append(_normalize_cand(it))
+    return out
+
+def _find_seg_row(seg_id: int) -> dict | None:
+    for r in STATE.match_segments:
+        try:
+            if int(r.get("seg_id")) == int(seg_id):
+                return r
+        except Exception:
+            continue
+    return None
+
+
+def _dedup_candidates(items: list[dict]) -> list[dict]:
+    """Deduplicate by (scene_id, scene_seg_idx, start, end, faiss_id)."""
+    seen = set()
+    out: list[dict] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        key = (
+            it.get("scene_id"),
+            it.get("scene_seg_idx"),
+            round(float(it.get("start") or 0.0), 3),
+            round(float(it.get("end") or 0.0), 3),
+            it.get("faiss_id"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+@app.get("/candidates")
+def candidates(seg_id: int = Query(...), mode: str = Query("top"), k: int = Query(120), offset: int = Query(0)):
+    """Return candidates for a clip seg.
+
+    mode:
+      - top:   use row.top_matches only
+      - scene: filter candidates to same movie scene as the current *applied* (or matched) choice
+      - all:   applied (if any) + matched + top_matches, de-duplicated
+    """
+    row = _find_seg_row(seg_id)
+    if not row:
+        raise HTTPException(404, "seg not found")
+
+    applied = (STATE.applied_changes or {}).get(seg_id)
+    matched = row.get("matched_orig_seg")
+    top = list(row.get("top_matches", [])) or []
+    explain_extra = _get_explain_candidates(seg_id)
+
+    def _tag(it: dict, src: str) -> dict:
+        if not isinstance(it, dict):
+            return it
+        it = dict(it)
+        it.setdefault("source", src)
+        return it
+
+    items: list[dict] = []
+    mode = (mode or "top").lower()
+    if mode == "top":
+        items = [_tag(x, "top") for x in top] + [_tag(x, "explain") for x in explain_extra]
+    elif mode == "scene":
+        target_scene = None
+        if isinstance(applied, dict) and applied.get("scene_id") is not None:
+            target_scene = applied.get("scene_id")
+        elif isinstance(matched, dict) and matched.get("scene_id") is not None:
+            target_scene = matched.get("scene_id")
+        base = top
+        if target_scene is None:
+            items = []
+        else:
+            items = [_tag(x, "top") for x in base if int(x.get("scene_id") or -1) == int(target_scene)]
+            items.extend(_tag(x, "explain") for x in explain_extra if int(x.get("scene_id") or -1) == int(target_scene))
+    else:  # all
+        if isinstance(applied, dict):
+            items.append(_tag(applied, "applied"))
+        elif isinstance(matched, dict):
+            items.append(_tag(matched, "matched"))
+        items.extend(_tag(x, "top") for x in top)
+        items.extend(_tag(x, "explain") for x in explain_extra)
+    items = _dedup_candidates(items)
+
+    total = len(items)
+    sl = items[offset: offset + k]
+    return {"ok": True, "seg_id": seg_id, "mode": mode, "total": total, "items": sl}
+
 @app.get("/scenes")
 def scenes():
     return {"ok": True, "scenes": _scenes_summary()}
