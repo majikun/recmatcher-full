@@ -17,6 +17,8 @@ export default function App(){
   const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
   // 当前准备应用的候选（可能来自右侧候选列表，也可能来自“场景内原片段/走廊”面板）
   const [pendingChoice, setPendingChoice] = useState<{type:'cand'|'orig', data:any} | null>(null)
+  // 当前选中段对应的“选中原片段”（用于避免候选列表异步刷新把 Movie 的时间顶掉）
+  const [selectedMo, setSelectedMo] = useState<any|null>(null)
   const [followMovie,setFollowMovie]=useState<boolean>(true)
   const [loop,setLoop]=useState<boolean>(true)
   const [mirrorClip, setMirrorClip] = useState<boolean>(false)
@@ -44,6 +46,18 @@ export default function App(){
   const [showDebugPanel, setShowDebugPanel] = useState<boolean>(true)
   const [overrides, setOverrides] = useState<any>(null)
   const [sceneHints, setSceneHints] = useState<Record<number, {scene_id:number, scene_seg_idx:number} | null>>({})
+    // 兼容 overrides 的 key 既可能是数字也可能是字符串
+  const getOverrideForSeg = (segId: number) => {
+    const d: any = overrides?.data || {}
+    return d[segId] ?? d[String(segId)] ?? null
+  }
+
+  // 将 seg 的 matched_orig_seg 与 override 合并，优先取 override 字段（保留以备他处使用）
+  const getMergedMatchForSeg = (seg: SegmentRow) => {
+    const ov: any = getOverrideForSeg(seg.seg_id)
+    const base = (seg as any).matched_orig_seg || null
+    return ov ? ({ ...(base||{}), ...ov }) : (base || null)
+  }
 
   async function refreshOverrides(){
     try{
@@ -124,6 +138,9 @@ export default function App(){
     sceneId?: number,
     sceneSegIdx?: number
   } | null>(null) // 记录当前正在校对的clip segment信息
+
+  // 最近一次 seek 的来源：用于避免左侧点击后被自动 useEffect 立即覆盖
+  const lastSeekByRef = useRef<'left'|'right'|'auto'|null>(null)
   
 
   async function refreshScenes(){
@@ -166,8 +183,10 @@ export default function App(){
     } catch (e) {
       console.error('openProject failed', e)
     }
-    await refreshScenes()
-    await refreshOverrides()
+    await Promise.all([
+      refreshOverrides(),
+      refreshScenes(),
+    ])
   }
 
   // load segments when selection changes
@@ -178,7 +197,9 @@ export default function App(){
       if (selectedSeg) {
         // 设置当前活动场景为该段落所属的场景
         setActiveScene(selectedSeg.clip.scene_id || null)
-        
+        // 设置默认的“当前原片段”为服务端已应用的匹配
+        const merged = (selectedSeg as any).matched_orig_seg || null
+        setSelectedMo(merged)
         // 加载该场景的所有段落
         if (selectedSeg.clip.scene_id != null) {
           listSegments(selectedSeg.clip.scene_id).then(arr=>{
@@ -309,9 +330,11 @@ export default function App(){
     if (!r) return
     const clipStart = r.clip.start ?? 0
     const clipEnd   = r.clip.end   ?? (clipStart + 2)
-    let mo: any = r.matched_orig_seg || {}
+    let mo: any = selectedMo || (r as any).matched_orig_seg || {}
     const cand = (candList && candList[candIdx ?? selectedCandIdx]) || ((r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null)
-    if (followMovie && cand) mo = cand
+    const hasOv = !!(r as any).is_override
+    // 只有在“没有覆盖”和“没有手动选择 selectedMo”的情况下才允许跟随候选
+    if (!selectedMo && followMovie && !hasOv && cand) mo = cand
     const movStart = mo?.start ?? 0
     const movEnd   = mo?.end   ?? (movStart + 2)
     playPair(clipStart, clipEnd, movStart, movEnd)
@@ -322,6 +345,34 @@ export default function App(){
     setPlayingOrigSegId(mo?.seg_id ?? null)
     // 维护当前校对段信息（供右侧使用）
     setCurrentClipSegment({ segId: r.seg_id, clipStart, clipEnd, sceneId: r.clip.scene_id, sceneSegIdx: r.clip.scene_seg_idx })
+  }
+
+  // 左侧列表点击播放：严格使用服务端匹配；播放中点击直接忽略
+  function seekFromLeft(seg: SegmentRow){
+    if (isPlaying){ dlog('left click ignored: playing'); return }
+    const clipStart = seg.clip?.start ?? 0
+    const clipEnd   = seg.clip?.end   ?? (clipStart + 2)
+    const mo: any = (seg as any).matched_orig_seg || {}
+    setSelectedMo(mo)
+    const movStart = mo?.start ?? 0
+    const movEnd   = mo?.end   ?? (movStart + 2)
+    lastSeekByRef.current = 'left'
+    // 使用统一控制器
+    playPair(clipStart, clipEnd, movStart, movEnd)
+    // 选中并高亮播放态
+    setSelectedSegId(seg.seg_id)
+    setPlayingSegId(seg.seg_id)
+    setPlayingFromSide('left')
+    setPlayingType('clip')
+    setPlayingOrigSegId(mo?.seg_id ?? null)
+    setPendingChoice(null)
+    setCurrentClipSegment({
+      segId: seg.seg_id,
+      clipStart,
+      clipEnd,
+      sceneId: seg.clip.scene_id,
+      sceneSegIdx: seg.clip.scene_seg_idx
+    })
   }
 
   function seekToOrigSegment(origSeg: any) {
@@ -349,6 +400,7 @@ export default function App(){
       source: origSeg.source ?? 'scene'
     }
     setPendingChoice({ type: 'orig', data: mapped })
+    setSelectedMo(mapped || null)
   }
 
   function seekToCandidate(candidate: any, candIdx: number) {
@@ -359,6 +411,8 @@ export default function App(){
     const movEnd    = candidate.end   ?? (movStart + 2)
     setSelectedCandIdx(candIdx)
     setPendingChoice({ type: 'cand', data: candidate })
+    setSelectedMo(candidate || null)
+    lastSeekByRef.current = 'right'
     playPair(clipStart, clipEnd, movStart, movEnd)
     setPlayingSegId(currentClipSegment.segId)
     setPlayingFromSide('right')
@@ -367,7 +421,13 @@ export default function App(){
   }
 
   // When selection or candidate selection changes, seek
-  useEffect(()=>{ seekTo() },[selectedSegId, selectedCandIdx, followMovie, candList])
+  useEffect(()=>{
+    if (lastSeekByRef.current === 'left') { // 左侧点击刚刚触发过精确 seek，避免被自动 seek 覆盖
+      lastSeekByRef.current = null
+      return
+    }
+    seekTo()
+  },[selectedSegId, selectedCandIdx, followMovie, candList])
 
   // Accept selected candidate for selected row
   async function acceptSelected(){
@@ -389,11 +449,18 @@ export default function App(){
       await applyChanges([change])
 
       // 本地乐观更新：更新中间表（segments）里该行
-      setSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}}) : row) : prev)
+      setSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}, is_override: true, matched_source: 'applied'}) : row) : prev)
       // 也更新左侧 allSegments（段落列表）以保持一致
-      setAllSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}}) : row) : prev)
+      setAllSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}, is_override: true, matched_source: 'applied'}) : row) : prev)
+
+      // 乐观更新本地 overrides，立即点亮左侧 ✓ 标记（保留以便调试面板查看）
+      setOverrides(prev => {
+        const data = { ...(prev?.data || {}), [String(r.seg_id)]: { ...chosen } }
+        return { ...(prev || {}), data, count: Object.keys(data).length }
+      })
 
       console.log('[apply] applied on seg', r.seg_id, '->', chosen)
+      await refreshOverrides()
     } catch (e:any) {
       console.error('[apply] failed', e)
       alert('应用失败: ' + (e?.message || String(e)))
@@ -445,15 +512,15 @@ export default function App(){
             <div style={{fontSize:12,opacity:.7,padding:'8px 4px'}}>无段落数据</div>
           )}
           {Array.isArray(allSegments) && allSegments.map((seg:SegmentRow)=>{
-            const mo = seg.matched_orig_seg || {}
+            const mo: any = seg.matched_orig_seg || null
             const clipSceneId = seg.clip.scene_id
-            const origSegId = mo.seg_id
-            const hasOverride = overrides?.data && overrides.data[seg.seg_id]
-            
+            const origSegId = mo?.seg_id
+            const hasOverride = !!(seg as any).is_override
+
             return (
               <div key={seg.seg_id}
                    className='candidate'
-                   onClick={()=>setSelectedSegId(seg.seg_id)}
+                   onClick={()=>{ setSelectedSegId(seg.seg_id); seekFromLeft(seg) }}
                    style={{
                      borderColor: selectedSegId===seg.seg_id ? '#409eff' : '#eee',
                      background: selectedSegId===seg.seg_id ? '#f5fbff' :  '#fff',
@@ -591,8 +658,18 @@ export default function App(){
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
                 <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
-                  { range ? `${formatTime(range.movieStart + movieCurrentTime)} / ${formatTime(range.movieEnd)}`
-                          : (()=>{ const mo = selectedRow?.matched_orig_seg || (candList && candList[selectedCandIdx]); const ms=mo?.start??0; const me=mo?.end??(ms+movieDuration); return `${formatTime(ms + movieCurrentTime)} / ${formatTime(me)}` })() }
+                  { range ? `${formatTime(range.movieStart + movieCurrentTime)} / ${formatTime(range.movieEnd)}` 
+                  : (()=>{ 
+                      if (!selectedRow) return `${formatTime(0)} / ${formatTime(movieDuration)}`
+                      const hasOv = !!(selectedRow as any).is_override
+                      let mo:any = selectedMo || (selectedRow as any).matched_orig_seg || {}
+                      if (!selectedMo && followMovie && !hasOv && candList) {
+                        const c = candList[selectedCandIdx]
+                        if (c) mo = c
+                      }
+                      const ms=mo?.start??0; const me=mo?.end??(ms+movieDuration)
+                      return `${formatTime(ms + movieCurrentTime)} / ${formatTime(me)}`
+                    })() }
                 </div>
                 <input
                   type="range"
@@ -616,7 +693,7 @@ export default function App(){
           <thead><tr><th>seg_id</th><th>clip idx</th><th>clip t</th><th>orig t</th><th>matched scene/idx</th><th>score</th><th>操作</th></tr></thead>
           <tbody>
             {segments.map((s:SegmentRow)=>{
-              const mo = s.matched_orig_seg || {}
+              const mo: any = (s as any).matched_orig_seg || {}
               // 格式化 clip 时间
               const clipStart = s.clip.start ?? 0
               const clipEnd = s.clip.end ?? 0
@@ -664,7 +741,7 @@ export default function App(){
                 <td>{s.clip.scene_seg_idx}</td>
                 <td style={{ fontSize: '12px' }}>{clipTime}</td>
                 <td style={{ fontSize: '12px' }}>{origTime}</td>
-                <td>seg{s.seg_id} S{mo.scene_id??'-'} / idx {mo.scene_seg_idx??'-'}</td>
+                <td>seg{mo.seg_id??'-'} S{mo.scene_id??'-'} / idx {mo.scene_seg_idx??'-'}</td>
                 <td>{(mo.score??0).toFixed(3)}</td>
                 <td>
                   <button onClick={(e)=>{ e.stopPropagation(); acceptSelected() }}>接受候选</button>

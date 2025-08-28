@@ -68,6 +68,12 @@ def _scenes_summary():
     data = []
     for cid in order:
         segs = groups.get(cid, [])
+        applied_map = STATE.applied_changes or {}
+        override_count = 0
+        try:
+            override_count = sum(1 for s in segs if s and s.get("seg_id") in applied_map)
+        except Exception:
+            override_count = 0
         avg = 0.0
         if segs:
             vals = []
@@ -87,6 +93,7 @@ def _scenes_summary():
             "count": len(segs),
             "avg_conf": avg,
             "chain_len": chain_len,
+            "override_count": override_count,
         })
     return data
 
@@ -360,11 +367,21 @@ def segments(clip_scene_id: int = Query(...)):
     out=[]
     for r in segs:
         seg_id = r.get("seg_id")
-        mo = STATE.applied_changes.get(seg_id, r.get("matched_orig_seg"))
+        applied_map = STATE.applied_changes or {}
+        is_override = seg_id in applied_map
+        mo = applied_map.get(seg_id) or r.get("matched_orig_seg")
+        matched_source = "applied" if is_override else "matched"
         out.append({
             "seg_id": seg_id,
-            "clip": {"scene_seg_idx": r.get("scene_seg_idx"), "start": r.get("start"), "end": r.get("end"), "scene_id": r.get("scene_id")},
+            "clip": {
+                "scene_seg_idx": r.get("scene_seg_idx"),
+                "start": r.get("start"),
+                "end": r.get("end"),
+                "scene_id": r.get("scene_id"),
+            },
             "matched_orig_seg": mo,
+            "matched_source": matched_source,
+            "is_override": is_override,
             "top_matches": r.get("top_matches", []),
         })
     return out
