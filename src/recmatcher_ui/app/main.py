@@ -11,38 +11,51 @@ import json
 app = FastAPI(title="Recmatcher UI Backend", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+def _scenes_summary():
+    groups = group_by_clip_scene(STATE.match_segments)
+    order = []
+    last = object()
+    for r in STATE.match_segments:
+        cid = r.get("scene_id")
+        if cid != last:
+            order.append(cid)
+            last = cid
+    data = []
+    for cid in order:
+        segs = groups.get(cid, [])
+        avg = 0.0
+        if segs:
+            vals = []
+            for s in segs:
+                mo = s.get("matched_orig_seg") or {}
+                sc = float(mo.get("score") or 0.0)
+                if mo.get("is_fill"):
+                    sc *= 0.5
+                vals.append(sc)
+            avg = sum(vals) / len(vals)
+        chain_len = 1
+        key = str(cid)
+        if key in STATE.scene_out:
+            chain_len = int(STATE.scene_out[key].get("stats", {}).get("chain_len", 1))
+        data.append({
+            "clip_scene_id": cid,
+            "count": len(segs),
+            "avg_conf": avg,
+            "chain_len": chain_len,
+        })
+    return data
+
 @app.get("/healthz")
 def healthz(): return {"ok": True}
 
 @app.post("/project/open")
 def open_project(req: OpenProjectReq):
-    if not Path(req.root).exists(): raise HTTPException(404,"root not found")
+    if not Path(req.root).exists():
+        raise HTTPException(404, "root not found")
     STATE.load_project(req.root, req.movie_path, req.clip_path)
     STATE.build_explain_offsets()
-    # scene summary
-    groups = group_by_clip_scene(STATE.match_segments)
-    order=[]; last=object()
-    for r in STATE.match_segments:
-        cid=r.get("scene_id")
-        if cid!=last: order.append(cid); last=cid
-    data=[]
-    for cid in order:
-        segs=groups.get(cid,[])
-        avg = 0.0
-        if segs:
-            vals=[]
-            for s in segs:
-                mo = s.get("matched_orig_seg") or {}
-                sc = float(mo.get("score") or 0.0)
-                if mo.get("is_fill"): sc *= 0.5
-                vals.append(sc)
-            avg = sum(vals)/len(vals)
-        chain_len=1
-        key=str(cid)
-        if key in STATE.scene_out:
-            chain_len = int(STATE.scene_out[key].get("stats",{}).get("chain_len",1))
-        data.append({"clip_scene_id": cid, "count": len(segs), "avg_conf": avg, "chain_len": chain_len})
-    return {"ok": True, "scenes": data, "paths": STATE.paths}
+    scenes = _scenes_summary()
+    return {"ok": True, "scenes": scenes, "paths": STATE.paths}
 
 @app.get("/video/movie")
 def video_movie():
@@ -55,6 +68,10 @@ def video_clip():
     p = STATE.paths.get("clip")
     if not p or not Path(p).exists(): raise HTTPException(404,"clip not set")
     return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
+
+@app.get("/scenes")
+def scenes():
+    return {"ok": True, "scenes": _scenes_summary()}
 
 @app.get("/segments")
 def segments(clip_scene_id: int = Query(...)):
