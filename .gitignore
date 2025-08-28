@@ -12,3 +12,5 @@ venv/
 *.mov
 /out/
 recmatcher.egg-info/
+node_modules/
+package-lock.json
