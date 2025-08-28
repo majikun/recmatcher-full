@@ -43,4 +43,28 @@ class InMemoryState:
         self._explain_offsets = off
         return len(off)-1
 
+    def read_explain(self, seg_id: int) -> dict | None:
+        """Read explain record for given seg_id. 
+        Note: seg_id and line numbers are not 1:1, so we search through the file.
+        """
+        from pathlib import Path
+        if not self.explain_path or not Path(self.explain_path).exists():
+            return None
+        
+        try:
+            import json
+            with open(self.explain_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    data = json.loads(line)
+                    if data.get('type') == 'segment' and data.get('seg_id') == seg_id:
+                        return data
+                        
+            return None
+        except Exception:
+            return None
+
 STATE = InMemoryState()
