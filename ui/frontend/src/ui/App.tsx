@@ -462,11 +462,11 @@ export default function App(){
                    }}>
                 <div style={{display:'flex', justifyContent:'space-between', marginBottom:4}}>
                   <div>
-                    #{seg.seg_id} {clipSceneId}
+                    #{seg.seg_id} S{clipSceneId}/idx {seg.clip.scene_seg_idx}
                     {hasOverride && <span style={{color:'#409eff', marginLeft:8}}>✓ </span>}
                   </div>
                   <div style={{fontWeight:600, fontSize:12, opacity:0.7}}>
-                    {mo ? `scene ${mo.scene_id} / idx ${mo.scene_seg_idx}` : '-'}
+                    seg {origSegId} {mo ? `S${mo.scene_id} / idx ${mo.scene_seg_idx}` : '-'}
                   </div>
                 </div>
                 <div style={{fontSize:12, opacity:0.7}}>
@@ -479,7 +479,7 @@ export default function App(){
                 )}
                 {mo && (
                   <div style={{fontSize:12, opacity:0.6, marginTop:2}}>
-                    seg_id: {origSegId}
+                    {mo ? `scene ${mo.scene_id} / idx ${mo.scene_seg_idx}` : '-'}
                   </div>
                 )}
               </div>
@@ -664,7 +664,7 @@ export default function App(){
                 <td>{s.clip.scene_seg_idx}</td>
                 <td style={{ fontSize: '12px' }}>{clipTime}</td>
                 <td style={{ fontSize: '12px' }}>{origTime}</td>
-                <td>{mo.scene_id??'-'} / {mo.scene_seg_idx??'-'}</td>
+                <td>seg{s.seg_id} S{mo.scene_id??'-'} / idx {mo.scene_seg_idx??'-'}</td>
                 <td>{(mo.score??0).toFixed(3)}</td>
                 <td>
                   <button onClick={(e)=>{ e.stopPropagation(); acceptSelected() }}>接受候选</button>
@@ -784,7 +784,7 @@ export default function App(){
                                 color: isPlaying ? '#ff6b35' : '#333'
                               }}>
                                 {isPlaying && <span style={{ marginRight: 4, color: '#ff6b35' }}>▶</span>}
-                                seg {origSeg.seg_id} / idx {origSeg.scene_seg_idx}
+                                seg {origSeg.seg_id} S{origSeg._sceneId} / idx {origSeg.scene_seg_idx}
                                 {isCandidate && <span style={{color:'#67c23a', marginLeft:8}}>✓ 候选</span>}
                                 {!origSeg._isCurrentScene && <span style={{color:'#999', marginLeft:8, fontSize:11}}>其他场景</span>}
                               </div>
@@ -841,9 +841,8 @@ export default function App(){
                       <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
                         <div style={{ fontWeight: isPlaying ? 'bold' : 'normal', color: isPlaying ? '#ff6b35' : '#333' }}>
                           {isPlaying && <span style={{ marginRight: 4 }}>▶</span>}
-                          seg {origSeg.seg_id} / idx {origSeg.scene_seg_idx}
+                          seg {origSeg.seg_id} S{origSeg._sceneId} / idx {origSeg.scene_seg_idx}
                           {isCandidate && <span style={{color:'#67c23a', marginLeft:8}}>✓ 候选</span>}
-                          <span style={{color:'#999', marginLeft:8, fontSize:11}}>S{origSeg._sceneId}</span>
                         </div>
                         <div style={{fontWeight:600}}>{isCandidate ? (candList.find(c => c.seg_id===origSeg.seg_id)?.score?.toFixed?.(3) ?? '-') : '-'}</div>
                       </div>
@@ -878,9 +877,8 @@ export default function App(){
                       <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
                         <div style={{ fontWeight: isPlaying ? 'bold' : 'normal', color: isPlaying ? '#ff6b35' : '#333' }}>
                           {isPlaying && <span style={{ marginRight: 4 }}>▶</span>}
-                          seg {origSeg.seg_id} / idx {origSeg.scene_seg_idx}
+                          seg {origSeg.seg_id} S{origSeg._sceneId} / idx {origSeg.scene_seg_idx}
                           {isCandidate && <span style={{color:'#67c23a', marginLeft:8}}>✓ 候选</span>}
-                          <span style={{color:'#999', marginLeft:8, fontSize:11}}>S{origSeg._sceneId}</span>
                         </div>
                         <div style={{fontWeight:600}}>{isCandidate ? (candList.find(c => c.seg_id===origSeg.seg_id)?.score?.toFixed?.(3) ?? '-') : '-'}</div>
                       </div>
@@ -925,7 +923,7 @@ export default function App(){
                     color: isPlaying ? '#ff6b35' : '#333'
                   }}>
                     {isPlaying && <span style={{ marginRight: 4 }}>▶</span>}
-                    scene {c.scene_id} / idx {c.scene_seg_idx}
+                    seg{c.seg_id} S{c.scene_id} / idx {c.scene_seg_idx}
                   </div>
                   <div style={{fontWeight:600}}>{(c.score??0).toFixed?.(3) ?? c.score}</div>
                 </div>
