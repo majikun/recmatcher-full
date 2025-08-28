@@ -49,6 +49,24 @@ export default function App(){
   const movieSeekingRef = useRef<boolean>(false)
   const dlog = (...args:any[]) => { if (debug) console.log('[UI]', ...args) }
 
+  const [showDebugPanel, setShowDebugPanel] = useState<boolean>(true)
+  const [overrides, setOverrides] = useState<any>(null)
+
+  async function refreshOverrides(){
+    try{
+      const resp = await fetch(`${BACKEND_BASE}/overrides`)
+      const j = await resp.json()
+      setOverrides(j)
+      dlog('overrides', j)
+    }catch(e){ console.error('load overrides failed', e) }
+  }
+  async function clearOverrides(){
+    try{
+      await fetch(`${BACKEND_BASE}/overrides/clear`, {method:'POST'})
+      await refreshOverrides()
+    }catch(e){ console.error('clear overrides failed', e) }
+  }
+
   const [clipSrc, setClipSrc] = useState<string>(`${BACKEND_BASE}/video/clip`)
   const [movieSrc, setMovieSrc] = useState<string>(`${BACKEND_BASE}/video/movie`)
 
@@ -71,6 +89,7 @@ export default function App(){
       console.error('openProject failed', e)
     }
     await refreshScenes()
+    await refreshOverrides()
   }
 
   // load segments when scene changes
@@ -183,6 +202,7 @@ export default function App(){
     const cand = (r.top_matches && r.top_matches[selectedCandIdx]) || null
     if (!cand) return
     await applyChanges([{ seg_id: r.seg_id, chosen: cand }])
+    await refreshOverrides()
     // reload and advance to next row
     const arr = await listSegments(activeScene!)
     setSegments(arr)
@@ -198,6 +218,7 @@ export default function App(){
     await rebuildScene(activeScene)
     const arr = await listSegments(activeScene)
     setSegments(arr)
+    await refreshOverrides()
   }
 
   return <div className='layout'>
@@ -210,6 +231,8 @@ export default function App(){
       <label style={{marginRight:12}}><input type='checkbox' checked={loop} onChange={e=>setLoop(e.target.checked)} /> 循环当前段</label>
       <label style={{marginRight:12}}><input type='checkbox' checked={mirrorClip} onChange={e=>setMirrorClip(e.target.checked)} /> 镜像Clip</label>
       <label style={{marginRight:12}}><input type='checkbox' checked={debug} onChange={e=>setDebug(e.target.checked)} /> 调试日志</label>
+      <label style={{marginRight:12}}><input type='checkbox' checked={showDebugPanel} onChange={e=>setShowDebugPanel(e.target.checked)} /> 显示调试面板</label>
+      <button onClick={refreshOverrides}>刷新覆盖</button>
       <button onClick={doRebuild}>场景内重建</button>
       <button onClick={()=>save()}>保存导出</button>
     </div>
@@ -297,6 +320,39 @@ export default function App(){
           </div>
         </div>}
       </div>
+
+      {showDebugPanel && (
+        <div className='panel'>
+          <div style={{display:'flex', alignItems:'center', marginBottom:6}}>
+            <div style={{fontWeight:600}}>调试</div>
+            <div style={{marginLeft:12, fontSize:12, opacity:.7}}>sidecar: {overrides?.path || '-'}</div>
+            <div style={{marginLeft:12, fontSize:12, opacity:.7}}>count: {overrides?.count ?? '-'}</div>
+            <div style={{flex:1}}/>
+            <button onClick={clearOverrides}>清空覆盖</button>
+          </div>
+          <div style={{display:'grid', gridTemplateColumns:'1fr 2fr', gap:12}}>
+            <div>
+              <div style={{fontSize:12, opacity:.7, marginBottom:4}}>覆盖列表（前 50 条）</div>
+              <div style={{maxHeight:240, overflow:'auto', border:'1px solid #eee', borderRadius:4, padding:8}}>
+                {overrides?.data ?
+                  Object.entries(overrides.data).slice(0,50).map(([k,v]: any) => (
+                    <div key={k} style={{padding:'4px 0', borderBottom:'1px dashed #eee'}}>
+                      <div style={{fontWeight:600}}>seg {k}</div>
+                      <div style={{fontSize:12, opacity:.8}}>scene {v?.scene_id} / idx {v?.scene_seg_idx} | score {(v?.score??0).toFixed?.(3)}</div>
+                    </div>
+                  ))
+                  : <div style={{fontSize:12, opacity:.6}}>暂无数据</div>}
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:12, opacity:.7, marginBottom:4}}>原始 JSON（截断显示）</div>
+              <div style={{maxHeight:240, overflow:'auto', border:'1px solid #eee', borderRadius:4, padding:8}}>
+                <pre style={{margin:0, fontSize:12}}>{JSON.stringify(overrides?.data ?? {}, null, 2).slice(0, 4000)}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   </div>
 }
