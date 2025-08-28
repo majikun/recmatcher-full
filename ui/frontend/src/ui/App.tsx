@@ -51,6 +51,7 @@ export default function App(){
 
   const [showDebugPanel, setShowDebugPanel] = useState<boolean>(true)
   const [overrides, setOverrides] = useState<any>(null)
+  const [sceneHints, setSceneHints] = useState<Record<number, {scene_id:number, scene_seg_idx:number} | null>>({})
 
   async function refreshOverrides(){
     try{
@@ -66,6 +67,27 @@ export default function App(){
       await refreshOverrides()
     }catch(e){ console.error('clear overrides failed', e) }
   }
+
+  async function ensureSceneHint(sceneId: number){
+    if (sceneHints.hasOwnProperty(sceneId)) return
+    try{
+      const arr = await listSegments(sceneId)
+      let hint: any = null
+      if (Array.isArray(arr) && arr.length){
+        const row = arr[0] as any
+        const mo = row?.matched_orig_seg || (row?.top_matches && row.top_matches[0])
+        if (mo && mo.scene_id!=null && mo.scene_seg_idx!=null){
+          hint = { scene_id: mo.scene_id, scene_seg_idx: mo.scene_seg_idx }
+        }
+      }
+      setSceneHints(prev=> ({ ...prev, [sceneId]: hint }))
+    }catch(e){ console.error('ensureSceneHint failed', e) }
+  }
+  useEffect(()=>{
+    if (!Array.isArray(scenes) || scenes.length===0) return
+    const firstIds = scenes.slice(0, Math.min(20, scenes.length)).map(s=>s.clip_scene_id)
+    firstIds.forEach(id=>{ ensureSceneHint(id) })
+  }, [scenes])
 
   const [clipSrc, setClipSrc] = useState<string>(`${BACKEND_BASE}/video/clip`)
   const [movieSrc, setMovieSrc] = useState<string>(`${BACKEND_BASE}/video/movie`)
@@ -247,9 +269,15 @@ export default function App(){
           {Array.isArray(scenes) && scenes.map((s:Scene)=>(
             <div key={s.clip_scene_id}
                  className={'scene-item '+(activeScene===s.clip_scene_id?'active':'')}
-                 onClick={()=>setActiveScene(s.clip_scene_id)}>
+                 onClick={()=>setActiveScene(s.clip_scene_id)}
+                 onMouseEnter={()=>ensureSceneHint(s.clip_scene_id)}>
               <div>#{s.clip_scene_id}</div>
               <div className='badge'>{s.count} / len {s.chain_len}</div>
+              <div className='badge' style={{marginLeft:8, opacity: sceneHints[s.clip_scene_id]===undefined? .5 : 1}}>
+                {sceneHints[s.clip_scene_id]
+                  ? `S${sceneHints[s.clip_scene_id]!.scene_id}:${sceneHints[s.clip_scene_id]!.scene_seg_idx}`
+                  : '…'}
+              </div>
             </div>
           ))}
         </div>
