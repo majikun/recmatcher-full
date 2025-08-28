@@ -356,9 +356,30 @@ export default function App(){
     seekWhenReady(cv, 0)
     seekWhenReady(mv, 0)
 
-    // Optional autoplay
-    try { cv && cv.play().catch(()=>{}) } catch {}
-    try { mv && mv.play().catch(()=>{}) } catch {}
+    // Optional autoplay with proper timing
+    const tryPlay = (video: HTMLVideoElement | null) => {
+      if (!video) return
+      const attemptPlay = () => {
+        try { 
+          video.play().catch(()=>{})
+        } catch {}
+      }
+      
+      if (video.readyState >= 3) { // HAVE_FUTURE_DATA
+        attemptPlay()
+      } else {
+        const onCanPlay = () => {
+          video.removeEventListener('canplay', onCanPlay)
+          attemptPlay()
+        }
+        video.addEventListener('canplay', onCanPlay)
+        // Fallback timeout
+        setTimeout(attemptPlay, 200)
+      }
+    }
+    
+    tryPlay(cv)
+    tryPlay(mv)
 
     // Set up loop handlers
     attachLoopSafe(cv, clipLoopStart, clipLoopEnd, clipLoopHandlerRef, clipSeekingRef)
@@ -448,7 +469,7 @@ export default function App(){
                   )}
                 </div>
                 <div style={{fontSize:11, opacity:0.7, marginTop:2}}>
-                  → orig {origSegId || '-'}
+                  → {origSegId ? `scene ${mo?.scene_id || '-'} / idx ${mo?.scene_seg_idx || '-'} (${origSegId})` : '-'}
                 </div>
               </div>
             )
@@ -571,14 +592,19 @@ export default function App(){
                                }}
                                onClick={() => {
                                  if (isCandidate) {
-                                   // 如果是候选项，按原有逻辑处理
-                                   const candIdx = candList.findIndex(c => c.seg_id === origSeg.seg_id)
+                                   // 对于候选项，使用原有的seekTo逻辑
+                                   const candIdx = candList.findIndex(c => 
+                                     c.seg_id === origSeg.seg_id && c.scene_id === origSeg.scene_id
+                                   )
                                    if (candIdx >= 0) {
                                      setSelectedCandIdx(candIdx)
                                      seekTo(selectedRow, candIdx)
+                                   } else {
+                                     // 如果在candList中找不到，使用备用方案
+                                     seekToOrigSegment(origSeg)
                                    }
                                  } else {
-                                   // 如果不是候选项，使用独立的播放函数
+                                   // 对于非候选项，使用独立的播放函数
                                    seekToOrigSegment(origSeg)
                                  }
                                }}>
