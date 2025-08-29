@@ -1,4 +1,3 @@
-// ui/frontend/src/ui/logic.ts
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AxiosError } from 'axios'
 import { listCandidates as apiListCandidates } from '../api'
@@ -136,6 +135,7 @@ export function usePlayerController(opts: PlayerOpts){
   const lastLoopAtRef = useRef<number>(0)
   const LOOP_THROTTLE_MS = 300
   const END_EPS = 0.08
+  const HARD_CLAMP_EPS = 0.15
 
   // 记录当前已加载的 chunk，用来命中复用
   const lastClipUrlRef = useRef<string | null>(null)
@@ -270,7 +270,7 @@ export function usePlayerController(opts: PlayerOpts){
 
       const cv = clipRef.current, mv = movieRef.current
       const r = rangeRef.current
-      if (!cv || !mv || !r || !syncPlay || !isPlaying) { raf = requestAnimationFrame(tick); return }
+      if (!cv || !mv || !r || !isPlaying) { raf = requestAnimationFrame(tick); return }
 
       const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
       const movLen  = Math.max(0.01, r.movieEnd - r.movieStart)
@@ -281,17 +281,26 @@ export function usePlayerController(opts: PlayerOpts){
       const cAtEnd = cv.currentTime >= cOff + clipLen - END_EPS
       const mAtEnd = mv.currentTime >= mOff + movLen  - END_EPS
 
-      if (cAtEnd || mAtEnd) {
+      const overEndHard = (cv.currentTime > cOff + clipLen + HARD_CLAMP_EPS) ||
+                          (mv.currentTime > mOff + movLen  + HARD_CLAMP_EPS)
+
+      if (cAtEnd || mAtEnd || overEndHard) {
         if (now - lastLoopAtRef.current > LOOP_THROTTLE_MS) {
           lastLoopAtRef.current = now
           const next = loopCount + 1
-          if (next <= Math.max(1, maxLoops)) {
+          const allowLoop = Math.max(1, maxLoops) > 1
+
+          if (allowLoop && next <= Math.max(1, maxLoops)) {
+            // 回到 offset，从头循环
             try { cv.currentTime = cOff } catch {}
             try { mv.currentTime = mOff } catch {}
             try { cv.play() } catch {}
             try { mv.play() } catch {}
             setLoopCount(next)
           } else {
+            // 不循环：精确夹到尾点再暂停，避免继续播放到补充片段
+            try { cv.currentTime = Math.min(cv.currentTime, cOff + clipLen) } catch {}
+            try { mv.currentTime = Math.min(mv.currentTime, mOff + movLen) } catch {}
             pause()
           }
         }
@@ -301,7 +310,7 @@ export function usePlayerController(opts: PlayerOpts){
     }
     raf = requestAnimationFrame(tick)
     return ()=> cancelAnimationFrame(raf)
-  }, [clipRef, movieRef, isPlaying, syncPlay, maxLoops, loopCount, pause])
+  }, [clipRef, movieRef, isPlaying, maxLoops, loopCount, pause])
 
   // 相对 seek：把滑块值映射到 offset
   const seekClipRel = useCallback((tRel:number)=>{
@@ -337,5 +346,6 @@ export function usePlayerController(opts: PlayerOpts){
     pause,
     seekClipRel,
     seekMovieRel,
+    getOffsets: () => ({ clipOffset: clipStartOffsetRef.current, movieOffset: movieStartOffsetRef.current }),
   }
 }

@@ -112,7 +112,7 @@ export default function App(){
   const [movieDuration, setMovieDuration] = useState<number>(0)
 
   // unified player controller
-  const [maxLoops, setMaxLoops] = useState<number>(3)
+  const [maxLoops, setMaxLoops] = useState<number>(1)
   const { isPlaying, loopCount, range, playPair, play: playSync, pause: pauseSync, seekClipRel, seekMovieRel, getOffsets } =
     usePlayerController({
       clipRef,
@@ -129,6 +129,7 @@ export default function App(){
         setMovieSrc(mUrl)
       }
     })
+  const getOffsetsSafe = (typeof (getOffsets as any) === 'function') ? (getOffsets as any) : (() => ({ clipOffset: 0, movieOffset: 0 }));
   
   // 播放态 / 当前行
   const [playingSegId, setPlayingSegId] = useState<number | null>(null)
@@ -567,7 +568,7 @@ export default function App(){
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
                 {(() => {
-                  const { clipOffset } = getOffsets()
+                  const { clipOffset } = getOffsetsSafe()
                   const relClipTime = Math.max(0, clipCurrentTime - clipOffset)
                   const clipLen = range ? Math.max(0.01, range.clipEnd - range.clipStart) : (clipDuration || 1)
                   return (
@@ -636,7 +637,7 @@ export default function App(){
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
                 {(() => {
-                  const { movieOffset } = getOffsets()
+                  const { movieOffset } = getOffsetsSafe()
                   const relMovieTime = Math.max(0, movieCurrentTime - movieOffset)
                   const movLen = range ? Math.max(0.01, range.movieEnd - range.movieStart) : (movieDuration || 1)
                   return (
