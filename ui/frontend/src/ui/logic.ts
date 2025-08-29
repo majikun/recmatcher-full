@@ -114,287 +114,169 @@ type PlayerOpts = {
   mirrorClip?: boolean
   debug?: boolean
   onSetSrc?: (clipUrl: string, movieUrl: string)=>void // 让 App.tsx 里去 setClipSrc/setMovieSrc
+  sidecarBase?: string
 }
 
 export function usePlayerController(opts: PlayerOpts){
-  const { clipRef, movieRef, backendBase, syncPlay, maxLoops, mirrorClip, debug, onSetSrc } = opts
+  const {
+    clipRef,
+    movieRef,
+    backendBase,     // kept for backward compat (unused in sidecar mode)
+    sidecarBase: sidecarBaseFromOpts,
+    syncPlay,
+    maxLoops,
+    mirrorClip,
+    debug,
+    onSetSrc
+  } = opts
 
+  // ---- Sidecar base (default to localhost:9777) ----
+  const SIDECAR_BASE = sidecarBaseFromOpts || `${location.protocol}//${location.hostname}:9777`
+  const USE_SIDECAR = true  // we now always prefer sidecar
+
+  // ---- Shared shape with old controller for App.tsx compatibility ----
   type Range = { clipStart:number, clipEnd:number, movieStart:number, movieEnd:number }
   const rangeRef = useRef<Range | null>(null)
-
   const [isPlaying, setIsPlaying] = useState(false)
   const [loopCount, setLoopCount] = useState(0)
 
-  // 片段偏移（相对于当前流起点 base 的 offset）
+  // Keep offsets for progress-bar mapping (in sidecar mode these are logical 0)
   const clipStartOffsetRef = useRef(0)
   const movieStartOffsetRef = useRef(0)
 
-  // 最近一次设置 src 后的“冷却窗口”，避免初始化阶段的 seek(0) 干扰
+  // Only used by legacy streaming path (kept for type parity)
   const suppressUntilRef = useRef<number>(0)
-  // 循环触发节流
-  const lastLoopAtRef = useRef<number>(0)
-  const LOOP_THROTTLE_MS = 300
-  const END_EPS = 0.08
-  const HARD_CLAMP_EPS = 0.15
 
-  // 记录当前已加载的 chunk，用来命中复用
-  const lastClipUrlRef = useRef<string | null>(null)
-  const lastMovieUrlRef = useRef<string | null>(null)
-  const lastClipBaseRef = useRef<number | null>(null)
-  const lastClipEffRef  = useRef<number | null>(null)
-  const lastMovBaseRef  = useRef<number | null>(null)
-  const lastMovEffRef   = useRef<number | null>(null)
-
-  // 轻量定位缓存（降低同一段短时间内重复 locate 带来的抖动）
-  const locateCacheRef = useRef<Map<string, {base:number, effective:number, offset:number, ts:number}>>(new Map())
-  const LOCATE_TTL_MS = 2000
-
-  // 并发保护：只让最新的一次 playPair 生效
+  // Latest command wins
   const actionIdRef = useRef(0)
 
-  const locate = async (kind:'clip'|'movie', t:number, d:number, pre:number, post:number)=>{
-    // 归一化 key，避免浮点毛刺导致缓存失效
-    const key = `${kind}:${t.toFixed(3)}:${d.toFixed(3)}:${pre}:${post}`
-    const now = Date.now()
-    const cache = locateCacheRef.current
-    const hit = cache.get(key)
-    if (hit && (now - hit.ts) < LOCATE_TTL_MS){
-      if (debug) console.log('[locate:cache]', key, hit)
-      return { base: hit.base, effective: hit.effective, offset: hit.offset }
-    }
-    const qs = new URLSearchParams({ kind, t:String(t), d:String(d), pre:String(pre), post:String(post) })
-    const r = await fetch(`${backendBase}/video/locate?`+qs.toString())
-    const j = await r.json()
-    if (debug) console.log('[locate]', j)
-    const rec = { base: Number(j.base)||t, effective: Number(j.effective)||d, offset: Number(j.offset)||0, ts: now }
-    cache.set(key, rec)
-    return { base: rec.base, effective: rec.effective, offset: rec.offset }
+  // ---------- helpers ----------
+  const postJSON = async (url: string, body: any) => {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {})
+    })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    return r.json().catch(()=> ({}))
   }
 
+  const getJSON = async (url: string) => {
+    const r = await fetch(url)
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    return r.json()
+  }
+
+  // ---------- core controls (sidecar) ----------
   const play = useCallback(async ()=>{
+    if (!USE_SIDECAR) {
+      try { await clipRef.current?.play(); await movieRef.current?.play() } catch {}
+      setIsPlaying(true)
+      return
+    }
     try {
-      await clipRef.current?.play()
-      await movieRef.current?.play()
+      await postJSON(`${SIDECAR_BASE}/resume`, {})
       setIsPlaying(true)
     } catch (e) {
-      if (debug) console.warn('[ctrl] play() blocked?', e)
+      if (debug) console.warn('[sidecar] resume failed', e)
       setIsPlaying(false)
     }
-  }, [clipRef, movieRef, debug])
+  }, [SIDECAR_BASE, USE_SIDECAR, clipRef, movieRef, debug])
 
-  const pause = useCallback(()=>{
-    clipRef.current?.pause(); movieRef.current?.pause(); setIsPlaying(false)
-  }, [clipRef, movieRef])
-
-  const waitSeeked = (v: HTMLVideoElement, target: number, eps = 0.05, timeoutMs = 1200) => new Promise<void>((resolve) => {
-    let done = false
-    const clear = () => { v.removeEventListener('seeked', onSeeked); v.removeEventListener('timeupdate', onTime); v.removeEventListener('loadedmetadata', onMeta); if(!done){done=true; resolve()} }
-    const onSeeked = () => { if (Math.abs(v.currentTime - target) <= eps) clear() }
-    const onTime = () => { if (Math.abs(v.currentTime - target) <= eps) clear() }
-    const onMeta = () => { try { v.currentTime = target } catch {}
+  const pause = useCallback(async ()=>{
+    if (!USE_SIDECAR) {
+      clipRef.current?.pause(); movieRef.current?.pause()
+      setIsPlaying(false)
+      return
     }
-    v.addEventListener('seeked', onSeeked)
-    v.addEventListener('timeupdate', onTime)
-    v.addEventListener('loadedmetadata', onMeta)
-    // 超时兜底
-    setTimeout(()=> clear(), timeoutMs)
-  })
-
-  const ensureSeek = (v: HTMLVideoElement | null, t: number) => {
-    if (!v) return
-    const doSeek = () => {
-      try { v.currentTime = Math.max(t, 0) } catch {}
-      // 双保险：短延迟再设一次，防止部分浏览器将第一次 seek 吃掉
-      setTimeout(() => { try { v.currentTime = Math.max(t, 0) } catch {} }, 50)
+    try {
+      await postJSON(`${SIDECAR_BASE}/pause`, {})
+    } catch (e) {
+      if (debug) console.warn('[sidecar] pause failed', e)
+    } finally {
+      setIsPlaying(false)
     }
-    if (v.readyState >= 1) doSeek()
-    else {
-      const onMeta = () => { v.removeEventListener('loadedmetadata', onMeta); doSeek() }
-      v.addEventListener('loadedmetadata', onMeta)
-    }
-  }
+  }, [SIDECAR_BASE, USE_SIDECAR, clipRef, movieRef, debug])
 
   const playPair = useCallback(async (clipStart:number, clipEnd:number, movieStart:number, movieEnd:number)=>{
     const myId = ++actionIdRef.current
 
-    const clipLen = Math.max(0.01, clipEnd - clipStart)
-    const movLen  = Math.max(0.01, movieEnd - movieStart)
-
-    // 预/后滚动（clip 更紧，movie 更宽）
-    const preC=0.2, postC=0.2, preM=0.8, postM=0.8
-
-    // 同步定位（base/effective/offset）
-    let lc, lm
-    try {
-      [lc, lm] = await Promise.all([
-        locate('clip',  clipStart, clipLen, preC, postC),
-        locate('movie', movieStart, movLen,  preM, postM),
-      ])
-    } catch {
-      lc = { base: clipStart, effective: clipLen, offset: 0 }
-      lm = { base: movieStart, effective: movLen,  offset: 0 }
-    }
-
-    // 如果期间有更新的 playPair 抢先了，放弃本次
-    if (myId !== actionIdRef.current) return
-
-    clipStartOffsetRef.current = Math.max(0, Number(lc.offset)||0)
-    movieStartOffsetRef.current = Math.max(0, Number(lm.offset)||0)
-
-    // 构造流 URL
-    const clipUrl  = `${backendBase}/video/clip?t=${Number(lc.base).toFixed(3)}&d=${Number(lc.effective).toFixed(3)}&pre=${preC}&post=${postC}`
-    const movieUrl = `${backendBase}/video/movie?t=${Number(lm.base).toFixed(3)}&d=${Number(lm.effective).toFixed(3)}&pre=${preM}&post=${postM}`
-
-    const needSetClip  = (clipUrl  !== lastClipUrlRef.current)
-    const needSetMovie = (movieUrl !== lastMovieUrlRef.current)
-
-    // 只有在 URL 变化时才更新 src，避免重复解码引起的抖动
-    if (needSetClip || needSetMovie){
-      onSetSrc?.(needSetClip ? clipUrl : (lastClipUrlRef.current || clipUrl),
-                 needSetMovie ? movieUrl : (lastMovieUrlRef.current || movieUrl))
-      lastClipUrlRef.current  = clipUrl
-      lastMovieUrlRef.current = movieUrl
-      lastClipBaseRef.current = Number(lc.base)
-      lastClipEffRef.current  = Number(lc.effective)
-      lastMovBaseRef.current  = Number(lm.base)
-      lastMovEffRef.current   = Number(lm.effective)
-      // 冷却：仅在真正换源时启用
-      suppressUntilRef.current = Date.now() + 1200
-    }
-
-    // 设定逻辑播放范围，供结束判断与进度条使用
+    // define logical range for UI display / loop logic
     rangeRef.current = { clipStart, clipEnd, movieStart, movieEnd }
     setLoopCount(0)
 
-    // 初始 seek 到各自 offset（相对当前流从 0 开始）
-    const clipOffset  = Math.max(0, clipStartOffsetRef.current)
-    const movieOffset = Math.max(0, movieStartOffsetRef.current)
-    ensureSeek(clipRef.current,  clipOffset)
-    ensureSeek(movieRef.current, movieOffset)
+    // In sidecar mode we do not set video src at all
+    if (onSetSrc) onSetSrc('', '')
 
-    // 等待就位（只要 latest）
-    if (myId !== actionIdRef.current) return
+    if (!USE_SIDECAR) {
+      // legacy path (kept only for parity; not used)
+      try {
+        clipRef.current && (clipRef.current.currentTime = 0)
+        movieRef.current && (movieRef.current.currentTime = 0)
+      } catch {}
+      setIsPlaying(true)
+      return
+    }
+
+    // Call sidecar to start pair playback (AB loop is handled by sidecar)
     try {
-      if (clipRef.current)  await waitSeeked(clipRef.current,  clipOffset)
-      if (movieRef.current) await waitSeeked(movieRef.current, movieOffset)
-    } catch {}
+      const payload = {
+        clipStart, clipEnd,
+        movieStart, movieEnd,
+        loops: Math.max(1, maxLoops),
+        sync: !!syncPlay
+      }
+      if (debug) console.log('[sidecar] /play_pair', payload)
+      await postJSON(`${SIDECAR_BASE}/play_pair`, payload)
+      if (myId !== actionIdRef.current) return
+      setIsPlaying(true)
+    } catch (e) {
+      console.error('[sidecar] play_pair failed', e)
+      setIsPlaying(false)
+    }
+  }, [SIDECAR_BASE, USE_SIDECAR, maxLoops, syncPlay, onSetSrc, clipRef, movieRef, debug])
 
-    if (myId !== actionIdRef.current) return
-    await play()
-  }, [backendBase, clipRef, movieRef, onSetSrc, play, pause])
+  // Relative seek (map UI slider 0..len to absolute inside current range)
+  const seekClipRel = useCallback(async (tRel:number)=>{
+    const r = rangeRef.current; if (!r) return
+    const len = Math.max(0.01, r.clipEnd - r.clipStart)
+    const ratio = Math.max(0, Math.min(1, len>0 ? tRel/len : 0))
+    if (!USE_SIDECAR) {
+      try { if (clipRef.current) clipRef.current.currentTime = ratio * len } catch {}
+      if (syncPlay) try { if (movieRef.current) movieRef.current.currentTime = ratio * Math.max(0.01, r.movieEnd - r.movieStart) } catch {}
+      return
+    }
+    try {
+      await postJSON(`${SIDECAR_BASE}/seek_rel`, { ratio })
+    } catch (e) {
+      if (debug) console.warn('[sidecar] seek_rel failed', e)
+    }
+  }, [SIDECAR_BASE, USE_SIDECAR, clipRef, movieRef, syncPlay, debug])
 
+  const seekMovieRel = useCallback(async (tRel:number)=>{
+    // We keep the same behaviour as seekClipRel: single ratio controls both when syncPlay=true
+    return seekClipRel(tRel)
+  }, [seekClipRel])
+
+  // ---------- poll sidecar status for loop count / play state ----------
   useEffect(()=>{
-    const cv = clipRef.current
-    const mv = movieRef.current
-    if (!cv || !mv) return
-
-    const handleEnded = () => {
-      const r = rangeRef.current
-      if (!r) return
-      const cOff = clipStartOffsetRef.current
-      const mOff = movieStartOffsetRef.current
-      const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
-      const movLen  = Math.max(0.01, r.movieEnd - r.movieStart)
-
-      const next = loopCount + 1
-      const allowLoop = Math.max(1, maxLoops) > 1
-
-      if (allowLoop && next <= Math.max(1, maxLoops)){
-        try { cv.currentTime = cOff } catch {}
-        try { mv.currentTime = mOff } catch {}
-        try { cv.play() } catch {}
-        try { mv.play() } catch {}
-        setLoopCount(next)
-      } else {
-        try { cv.currentTime = Math.min(cv.currentTime, cOff + clipLen) } catch {}
-        try { mv.currentTime = Math.min(mv.currentTime, mOff + movLen) } catch {}
-        pause()
+    if (!USE_SIDECAR) return
+    let timer = 0
+    const tick = async ()=>{
+      try {
+        const s = await getJSON(`${SIDECAR_BASE}/status`)
+        // Expected: { playing: boolean, loopCount?: number }
+        if (typeof s?.playing === 'boolean') setIsPlaying(!!s.playing)
+        if (typeof s?.loopCount === 'number') setLoopCount(s.loopCount)
+      } catch (e) {
+        // ignore
+      } finally {
+        timer = window.setTimeout(tick, 250)
       }
     }
-
-    cv.addEventListener('ended', handleEnded)
-    mv.addEventListener('ended', handleEnded)
-    return ()=>{
-      cv.removeEventListener('ended', handleEnded)
-      mv.removeEventListener('ended', handleEnded)
-    }
-  }, [clipRef, movieRef, maxLoops, loopCount, pause])
-
-  // RAF 轮询：仅在播放时检查是否到段尾，按 offset 回绕，并做节流
-  useEffect(()=>{
-    let raf = 0
-    const tick = ()=>{
-      const now = Date.now()
-      if (now < suppressUntilRef.current) { raf = requestAnimationFrame(tick); return }
-
-      const cv = clipRef.current, mv = movieRef.current
-      const r = rangeRef.current
-      if (!cv || !mv || !r || !isPlaying) { raf = requestAnimationFrame(tick); return }
-
-      const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
-      const movLen  = Math.max(0.01, r.movieEnd - r.movieStart)
-
-      const cOff = clipStartOffsetRef.current
-      const mOff = movieStartOffsetRef.current
-
-      const cAtEnd = cv.currentTime >= cOff + clipLen - END_EPS
-      const mAtEnd = mv.currentTime >= mOff + movLen  - END_EPS
-
-      const overEndHard = (cv.currentTime > cOff + clipLen + HARD_CLAMP_EPS) ||
-                          (mv.currentTime > mOff + movLen  + HARD_CLAMP_EPS)
-
-      if (cAtEnd || mAtEnd || overEndHard) {
-        if (now - lastLoopAtRef.current > LOOP_THROTTLE_MS) {
-          lastLoopAtRef.current = now
-          const next = loopCount + 1
-          const allowLoop = Math.max(1, maxLoops) > 1
-
-          if (allowLoop && next <= Math.max(1, maxLoops)) {
-            // 回到 offset，从头循环
-            try { cv.currentTime = cOff } catch {}
-            try { mv.currentTime = mOff } catch {}
-            try { cv.play() } catch {}
-            try { mv.play() } catch {}
-            setLoopCount(next)
-          } else {
-            // 不循环：精确夹到尾点再暂停，避免继续播放到补充片段
-            try { cv.currentTime = Math.min(cv.currentTime, cOff + clipLen) } catch {}
-            try { mv.currentTime = Math.min(mv.currentTime, mOff + movLen) } catch {}
-            pause()
-          }
-        }
-      }
-
-      raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    return ()=> cancelAnimationFrame(raf)
-  }, [clipRef, movieRef, isPlaying, maxLoops, loopCount, pause])
-
-  // 相对 seek：把滑块值映射到 offset
-  const seekClipRel = useCallback((tRel:number)=>{
-    const v = clipRef.current; const r = rangeRef.current; if (!v || !r) return
-    const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
-    const ratio = Math.max(0, Math.min(1, clipLen>0 ? tRel/clipLen : 0))
-    try { v.currentTime = clipStartOffsetRef.current + ratio * clipLen } catch {}
-    if (syncPlay) {
-      const mv = movieRef.current; if (!mv) return
-      const movLen = Math.max(0.01, r.movieEnd - r.movieStart)
-      try { mv.currentTime = movieStartOffsetRef.current + ratio * movLen } catch {}
-    }
-  }, [clipRef, movieRef, syncPlay])
-
-  const seekMovieRel = useCallback((tRel:number)=>{
-    const v = movieRef.current; const r = rangeRef.current; if (!v || !r) return
-    const movLen = Math.max(0.01, r.movieEnd - r.movieStart)
-    const ratio = Math.max(0, Math.min(1, movLen>0 ? tRel/movLen : 0))
-    try { v.currentTime = movieStartOffsetRef.current + ratio * movLen } catch {}
-    if (syncPlay) {
-      const cv = clipRef.current; if (!cv) return
-      const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
-      try { cv.currentTime = clipStartOffsetRef.current + ratio * clipLen } catch {}
-    }
-  }, [clipRef, movieRef, syncPlay])
+    timer = window.setTimeout(tick, 250)
+    return ()=> { if (timer) clearTimeout(timer) }
+  }, [SIDECAR_BASE, USE_SIDECAR])
 
   return {
     isPlaying,

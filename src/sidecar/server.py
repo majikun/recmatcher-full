@@ -1,6 +1,7 @@
 import os, json, socket, subprocess, time, threading
 from typing import Optional, Tuple
 from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ====== 配置 ======
@@ -19,6 +20,8 @@ MPV_ARGS_BASE = [
     "--demuxer-seekable-cache=yes",
     "--keep-open=no",
     "--profile=low-latency",
+    "--osc=no",
+    "--no-input-default-bindings",
 ]
 
 # ====== MPV JSON IPC 工具 ======
@@ -94,6 +97,31 @@ class MpvProc:
         # mpv: seek <value> [relative|absolute|absolute-percent|relative-percent] [exact|keyframes]
         self.cmd("seek", float(t), "absolute+exact")
 
+# ====== 播放控制辅助 ======
+def arm_segment(player: MpvProc, start: float, end: float):
+    """清理旧 AB、精确 seek 到 start，并开启 [start, end] 的 AB 循环与播放。"""
+    s, e = float(start), float(end)
+    # 清理旧 AB
+    player.set_prop("ab-loop-a", "no")
+    player.set_prop("ab-loop-b", "no")
+    # 设定新 AB
+    player.set_prop("ab-loop-a", s)
+    player.set_prop("ab-loop-b", e)
+    # 精确回到 A 点
+    player.set_prop("hr-seek", True)
+    player.seek_absolute(s)
+    # 循环与播放
+    player.set_prop("loop-file", "inf")
+    player.set_prop("pause", False)
+
+def set_mirror(player: MpvProc, enabled: bool):
+    """设置/清空水平镜像滤镜。"""
+    if enabled:
+        player.set_prop("vf", "hflip")
+    else:
+        # 清空所有 vf（只为简单起见）
+        player.set_prop("vf", "")
+
 # ====== 全局状态 ======
 clip = MpvProc(SOCK_CLIP)
 mov  = MpvProc(SOCK_MOV)
@@ -111,9 +139,25 @@ STATE = {
 # ====== FastAPI ======
 app = FastAPI(title="recmatcher-sidecar", version="0.1.0")
 
+# Enable CORS for dev (allow all). If you want to restrict, set SIDECAR_ALLOW_ORIGINS env to CSV.
+allow_origins_env = os.environ.get("SIDECAR_ALLOW_ORIGINS")
+if allow_origins_env:
+    allow_origins = [s.strip() for s in allow_origins_env.split(",") if s.strip()]
+else:
+    allow_origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],   # include OPTIONS for preflight
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 class OpenReq(BaseModel):
     movie: str
     clip: str
+    minimized: Optional[bool] = True  # 是否最小化窗口（默认最小化，避免打扰）
 
 @app.get("/health")
 def health():
@@ -123,17 +167,25 @@ def health():
 def open_files(req: OpenReq):
     STATE["movie_path"] = req.movie
     STATE["clip_path"]  = req.clip
-    # 启动/加载
+    # 启动/连接
     clip.start()
     mov.start()
+    # 加载文件
     if os.path.exists(req.clip):
         clip.load_file(req.clip)
     if os.path.exists(req.movie):
         mov.load_file(req.movie)
-    # 初始为暂停
+    # 初始暂停
     clip.set_prop("pause", True)
     mov.set_prop("pause", True)
-    return {"ok": True}
+    # 默认最小化，除非显式要求不最小化
+    try:
+        minimized = bool(req.minimized)
+    except Exception:
+        minimized = True
+    clip.set_prop("window-minimized", minimized)
+    mov.set_prop("window-minimized", minimized)
+    return {"ok": True, "paths": {"clip": STATE["clip_path"], "movie": STATE["movie_path"]}, "minimized": minimized}
 
 class PlayPairReq(BaseModel):
     clipStart: float
@@ -145,44 +197,58 @@ class PlayPairReq(BaseModel):
 
 @app.post("/play_pair")
 def play_pair(req: PlayPairReq):
-    # 确保已加载
+    # 确保进程与文件已打开
     clip.ensure(); mov.ensure()
-    # 再次 load（确保当前路径正确）
-    if STATE["clip_path"]:
-        clip.load_file(STATE["clip_path"])
-    if STATE["movie_path"]:
-        mov.load_file(STATE["movie_path"])
+    if not STATE["clip_path"] or not STATE["movie_path"]:
+        return {"ok": False, "error": "files not opened yet. call /open first"}
 
-    # 设置 AB 循环
+    # 镜像（仅 clip）
+    set_mirror(clip, bool(req.mirror))
+
+    # 记录范围
     a, b = float(req.clipStart), float(req.clipEnd)
-    clip.set_prop("ab-loop-a", a)
-    clip.set_prop("ab-loop-b", b)
-
     a2, b2 = float(req.movieStart), float(req.movieEnd)
-    mov.set_prop("ab-loop-a", a2)
-    mov.set_prop("ab-loop-b", b2)
-
-    # 镜像仅对 clip
-    if req.mirror:
-        clip.set_prop("vf", "hflip")
-    else:
-        clip.set_prop("vf", "")
-
-    # 从 A 精确起播
-    clip.seek_absolute(a)
-    mov.seek_absolute(a2)
-
-    # 循环与播放
     STATE["clip_range"] = (a, b)
     STATE["mov_range"]  = (a2, b2)
     STATE["loop"] = bool(req.loop)
     STATE["mirror"] = bool(req.mirror)
 
-    # mpv 的 ab-loop 会自动回绕；是否强制 loop 次数由 mpv 管
-    clip.set_prop("pause", False)
-    mov.set_prop("pause", False)
-
+    # 装填并开始循环
+    arm_segment(clip, a, b)
+    arm_segment(mov,  a2, b2)
     return {"ok": True}
+
+class WindowReq(BaseModel):
+    minimized: bool
+
+@app.post("/window/minimize")
+def window_minimize(req: WindowReq):
+    clip.set_prop("window-minimized", bool(req.minimized))
+    mov.set_prop("window-minimized", bool(req.minimized))
+    return {"ok": True}
+
+class LayoutReq(BaseModel):
+    # 比例（例如 0.5 = 占屏幕一半宽度/高度）
+    scale: float = 0.5
+    gap: int = 10
+    # 屏幕分辨率（macOS 多屏可手动指定）
+    screen_w: int = 1920
+    screen_h: int = 1080
+
+@app.post("/window/layout")
+def window_layout(req: LayoutReq):
+    w = int(req.screen_w * req.scale)
+    h = int(req.screen_h * req.scale)
+    gap = int(req.gap)
+    # 左右平铺
+    clip.set_prop("geometry", f"{w}x{h}+{gap}+{gap}")
+    mov.set_prop("geometry",  f"{w}x{h}+{w + 2*gap}+{gap}")
+    # 取消最小化，置于最前方便观察
+    clip.set_prop("window-minimized", False)
+    mov.set_prop("window-minimized", False)
+    clip.set_prop("ontop", True)
+    mov.set_prop("ontop", True)
+    return {"ok": True, "geometry": {"w": w, "h": h}}
 
 @app.post("/pause")
 def pause():
@@ -213,10 +279,16 @@ def seek_rel(req: SeekRelReq):
 @app.get("/status")
 def status():
     # 读取 mpv 当前时间
-    ct = clip.get_prop("playback-time")
-    mt = mov.get_prop("playback-time")
-    paused_c = clip.get_prop("pause")
-    paused_m = mov.get_prop("pause")
+    def read_state(p: MpvProc):
+        t = p.get_prop("time-pos")
+        paused = p.get_prop("pause")
+        # 规范化
+        if isinstance(paused, (int, float)):
+            paused = bool(paused)
+        return t, bool(paused) if paused is not None else None
+
+    ct, paused_c = read_state(clip)
+    mt, paused_m = read_state(mov)
     return {
         "ok": True,
         "clip": {"t": ct, "paused": paused_c},
@@ -228,4 +300,5 @@ def status():
         "loop": STATE["loop"],
         "mirror": STATE["mirror"],
         "paths": {"clip": STATE["clip_path"], "movie": STATE["movie_path"]},
+        "playing": (paused_c is False) and (paused_m is False),
     }

@@ -9,7 +9,27 @@ import { formatTime, usePersistedState, useCandidates, usePlayerController, type
  * 只在进度条 onChange 时做用户驱动的 seek。
  */
 
+
 const BACKEND_BASE = `${window.location.protocol}//${window.location.hostname}:8787`
+const SIDECAR_BASE = `${window.location.protocol}//${window.location.hostname}:9777`
+
+async function sidecarOpen(moviePath: string, clipPath: string) {
+  if (!moviePath || !clipPath) {
+    console.warn('[sidecar] movie/clip path empty, skip open', { moviePath, clipPath })
+    return
+  }
+  try {
+    const resp = await fetch(`${SIDECAR_BASE}/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ movie: moviePath, clip: clipPath }),
+    })
+    const j = await resp.json()
+    console.log('[sidecar] open ->', j)
+  } catch (e) {
+    console.error('[sidecar] open failed', e)
+  }
+}
 
 export default function App(){
   const [root, setRoot]   = usePersistedState<string>('rm_root', '')
@@ -188,11 +208,19 @@ export default function App(){
     } catch (e) {
       console.error('openProject failed', e)
     }
+    // Make sure sidecar has the absolute file paths
+    await sidecarOpen(movie, clip)
     await Promise.all([
       refreshOverrides(),
       refreshScenes(),
     ])
   }
+
+  useEffect(() => {
+    if (movie && clip) {
+      sidecarOpen(movie, clip)
+    }
+  }, [movie, clip])
 
   // selection -> load scene rows
   useEffect(()=>{
