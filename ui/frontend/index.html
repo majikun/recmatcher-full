@@ -15,4 +15,70 @@ html,body,#root{height:100%;margin:0} .layout{display:grid;grid-template-rows:au
 .seg-table th,.seg-table td{border-bottom:1px solid #eee;padding:6px 4px}
 .badge{font-size:11px;padding:2px 6px;border-radius:10px;background:#eee}
 </style>
-</head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+<style>
+/* ---- Single-window helper UI (does not change app logic) ---- */
+#miniCtrl { position: fixed; right: 8px; top: 8px; z-index: 10000; font-family: system-ui, Arial; }
+#miniCtrl .card { display:flex; gap:10px; align-items:center; background: #ffffffcc; backdrop-filter: blur(6px); border:1px solid #e5e7eb; box-shadow: 0 4px 14px rgba(0,0,0,.08); border-radius: 10px; padding: 6px 10px; }
+#miniCtrl .sep { width:1px; height:18px; background:#e5e7eb }
+#miniCtrl .status { font-size: 12px; color:#6b7280 }
+#miniCtrl input[type="checkbox"]{ transform: translateY(1px) }
+#miniCtrl .btn { font-size:12px; padding:4px 8px; border:1px solid #e5e7eb; border-radius:6px; cursor:pointer; background:#fff }
+#miniCtrl .btn:hover{ background:#f3f4f6 }
+</style>
+  <!-- Qt WebChannel (only effective when embedded in PySide6/QWebEngine) -->
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    // If Qt has injected a web channel transport, mark we are inside sidecar
+    if (window.qt) {
+      window.__IN_SIDECAR__ = true;
+    }
+  </script>
+<script>
+// Recmatcher boot settings: allow switching between HTML5 <video> and external mpv sidecar
+(function(){
+  const KEY = 'rm_use_sidecar';
+  // Decide default: if embedded in sidecar (Qt), prefer using mpv; otherwise default to single-window HTML5 video
+  const inSidecar = !!window.__IN_SIDECAR__;
+  if (localStorage.getItem(KEY) === null) {
+    localStorage.setItem(KEY, inSidecar ? '1' : '0');
+  }
+  // expose to the app before main.tsx loads
+  window.__RM_SETTINGS__ = { useSidecar: localStorage.getItem(KEY) === '1' };
+  // helper for toggling from this page
+  window.__RM_TOGGLE_SIDECAR__ = function(v){
+    localStorage.setItem(KEY, v ? '1' : '0');
+    window.__RM_SETTINGS__ = { useSidecar: !!v };
+    // notify the running React app (logic.ts / usePlayerController may listen to this)
+    window.postMessage({ type: 'rm-settings-changed', payload: { useSidecar: !!v } }, '*');
+  };
+})();
+</script>
+</head><body><div id="root"></div>
+<div id="miniCtrl">
+  <div class="card">
+    <label style="display:flex; align-items:center; gap:6px;">
+      <input id="ckSidecar" type="checkbox">
+      <span>外部播放器 (mpv)</span>
+    </label>
+    <div class="sep"></div>
+    <span class="status">单窗口模式：<b id="lblMode">启用</b></span>
+    <button class="btn" onclick="window.open(location.origin.replace(':5173', ':8787') + '/status', '_blank')">后端状态</button>
+    <button class="btn" onclick="window.open(location.origin.replace(':5173', ':9777') + '/status', '_blank')">mpv状态</button>
+  </div>
+</div>
+<script>
+(function(){
+  const ck = document.getElementById('ckSidecar');
+  const lbl = document.getElementById('lblMode');
+  const useSidecar = (window.__RM_SETTINGS__ && window.__RM_SETTINGS__.useSidecar) ? true : false;
+  ck.checked = useSidecar;
+  lbl.textContent = useSidecar ? '关闭' : '启用';
+  // If running inside sidecar, keep the toggle visible but default is already ON
+  ck.addEventListener('change', function(){
+    const v = ck.checked; // true => use external mpv
+    window.__RM_TOGGLE_SIDECAR__(v);
+    lbl.textContent = v ? '关闭' : '启用';
+  });
+})();
+</script>
+<script type="module" src="/src/main.tsx"></script></body></html>
