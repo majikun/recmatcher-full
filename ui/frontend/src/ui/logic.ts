@@ -3,6 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AxiosError } from 'axios'
 import { listCandidates as apiListCandidates } from '../api'
 
+async function fetchJSON<T=any>(url: string): Promise<T> {
+  const r = await fetch(url, { credentials: 'same-origin' })
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json() as Promise<T>
+}
+
 // ========== Types ==========
 
 export type Scene = { clip_scene_id:number, count:number, avg_conf:number, chain_len:number }
@@ -113,175 +119,219 @@ type PlayerOpts = {
 
 export function usePlayerController(opts: PlayerOpts){
   const { clipRef, movieRef, backendBase, syncPlay, maxLoops, mirrorClip, debug, onSetSrc } = opts
+
+  type Range = { clipStart:number, clipEnd:number, movieStart:number, movieEnd:number }
+  const rangeRef = useRef<Range | null>(null)
+
   const [isPlaying, setIsPlaying] = useState(false)
   const [loopCount, setLoopCount] = useState(0)
-  const [range, setRange] = useState<{clipStart:number,clipEnd:number,movieStart:number,movieEnd:number} | null>(null)
 
-  const clipHandlerRef = useRef<(this: HTMLVideoElement, ev: Event)=>any | null>(null)
-  const movieHandlerRef = useRef<(this: HTMLVideoElement, ev: Event)=>any | null>(null)
-  const endedClipRef = useRef(false)
-  const endedMovieRef = useRef(false)
+  // 片段偏移（相对于当前流起点 base 的 offset）
+  const clipStartOffsetRef = useRef(0)
+  const movieStartOffsetRef = useRef(0)
 
-  // 清理事件
-  const detach = useCallback(()=>{
-    const cv = clipRef.current, mv = movieRef.current
-    if (cv && clipHandlerRef.current) { cv.removeEventListener('timeupdate', clipHandlerRef.current as any); clipHandlerRef.current = null }
-    if (mv && movieHandlerRef.current) { mv.removeEventListener('timeupdate', movieHandlerRef.current as any); movieHandlerRef.current = null }
+  // 最近一次设置 src 后的“冷却窗口”，避免初始化阶段的 seek(0) 干扰
+  const suppressUntilRef = useRef<number>(0)
+  // 循环触发节流
+  const lastLoopAtRef = useRef<number>(0)
+  const LOOP_THROTTLE_MS = 300
+  const END_EPS = 0.08
+
+  // 记录当前已加载的 chunk，用来命中复用
+  const lastClipUrlRef = useRef<string | null>(null)
+  const lastMovieUrlRef = useRef<string | null>(null)
+  const lastClipBaseRef = useRef<number | null>(null)
+  const lastClipEffRef  = useRef<number | null>(null)
+  const lastMovBaseRef  = useRef<number | null>(null)
+  const lastMovEffRef   = useRef<number | null>(null)
+
+  const play = useCallback(async ()=>{
+    try {
+      await clipRef.current?.play()
+      await movieRef.current?.play()
+      setIsPlaying(true)
+    } catch (e) {
+      if (debug) console.warn('[ctrl] play() blocked?', e)
+      setIsPlaying(false)
+    }
+  }, [clipRef, movieRef, debug])
+
+  const pause = useCallback(()=>{
+    clipRef.current?.pause(); movieRef.current?.pause(); setIsPlaying(false)
   }, [clipRef, movieRef])
 
-  useEffect(()=>()=>detach(), [detach])
+  // 定位接口（服务端返回 base/effective/offset）
+  const locate = async (kind:'clip'|'movie', t:number, d:number, pre:number, post:number)=>{
+    const qs = new URLSearchParams({ kind, t:String(t), d:String(d), pre:String(pre), post:String(post) })
+    const r = await fetch(`${backendBase}/video/locate?`+qs.toString())
+    const j = await r.json()
+    if (debug) console.log('[locate]', j)
+    return j as { ok?:boolean, base:number, effective:number, offset:number }
+  }
 
-  const seekWhenReady = (v: HTMLVideoElement | null, t: number)=>{
+  const waitSeeked = (v: HTMLVideoElement, target: number, eps = 0.05, timeoutMs = 1200) => new Promise<void>((resolve) => {
+    let done = false
+    const clear = () => { v.removeEventListener('seeked', onSeeked); v.removeEventListener('timeupdate', onTime); v.removeEventListener('loadedmetadata', onMeta); if(!done){done=true; resolve()} }
+    const onSeeked = () => { if (Math.abs(v.currentTime - target) <= eps) clear() }
+    const onTime = () => { if (Math.abs(v.currentTime - target) <= eps) clear() }
+    const onMeta = () => { try { v.currentTime = target } catch {}
+    }
+    v.addEventListener('seeked', onSeeked)
+    v.addEventListener('timeupdate', onTime)
+    v.addEventListener('loadedmetadata', onMeta)
+    // 超时兜底
+    setTimeout(()=> clear(), timeoutMs)
+  })
+
+  const ensureSeek = (v: HTMLVideoElement | null, t: number) => {
     if (!v) return
-    const doSeek = ()=>{ try { v.currentTime = Math.max(t, 0) } catch {} }
+    const doSeek = () => {
+      try { v.currentTime = Math.max(t, 0) } catch {}
+      // 双保险：短延迟再设一次，防止部分浏览器将第一次 seek 吃掉
+      setTimeout(() => { try { v.currentTime = Math.max(t, 0) } catch {} }, 50)
+    }
     if (v.readyState >= 1) doSeek()
     else {
-      const onMeta = ()=>{ v.removeEventListener('loadedmetadata', onMeta); doSeek() }
+      const onMeta = () => { v.removeEventListener('loadedmetadata', onMeta); doSeek() }
       v.addEventListener('loadedmetadata', onMeta)
     }
   }
 
-  const attachLoop = (v: HTMLVideoElement | null, s: number, e: number, side: 'clip'|'movie')=>{
-    if (!v) return
-    const EPS = 0.03
-    const HOLD = 0.02 // 当本侧先到达末尾时，停在末尾附近等待另一侧
-    const len = Math.max(0.01, e - s)
-    const handler = ()=>{
-      if (!range) return
-      // 仅在区间播放时生效
-      const atEnd = v.currentTime >= Math.max(0.01, len) - EPS
-      if (!atEnd) return
+  const playPair = useCallback(async (clipStart:number, clipEnd:number, movieStart:number, movieEnd:number)=>{
+    const clipLen = Math.max(0.01, clipEnd - clipStart)
+    const movLen  = Math.max(0.01, movieEnd - movieStart)
 
-      if (side === 'clip') endedClipRef.current = true
-      else endedMovieRef.current = true
+    // 预/后滚动（clip 更紧，movie 更宽）
+    const preC=0.2, postC=0.2, preM=0.8, postM=0.8
 
-      const otherEnded = side === 'clip' ? endedMovieRef.current : endedClipRef.current
-
-      // 本侧先到：先停住并卡在末尾，等待另一侧
-      if (!otherEnded) {
-        try { v.pause() } catch {}
-        try { v.currentTime = Math.max(0, len - HOLD) } catch {}
-        return
-      }
-
-      // 两侧都到达末尾：统一做一次循环控制
-      setLoopCount(prev => {
-        const next = prev + 1
-        if (next >= maxLoops) {
-          try { clipRef.current?.pause() } catch {}
-          try { movieRef.current?.pause() } catch {}
-          return next
-        }
-        // 从头一起开始
-        try { clipRef.current && (clipRef.current.currentTime = 0) } catch {}
-        try { movieRef.current && (movieRef.current.currentTime = 0) } catch {}
-        // 清标志并继续播放
-        endedClipRef.current = false
-        endedMovieRef.current = false
-        try { clipRef.current?.play() } catch {}
-        try { movieRef.current?.play() } catch {}
-        return next
-      })
+    // 同步定位（base/effective/offset）
+    let lc, lm
+    try {
+      [lc, lm] = await Promise.all([
+        locate('clip',  clipStart, clipLen, preC, postC),
+        locate('movie', movieStart, movLen,  preM, postM),
+      ])
+    } catch (e) {
+      // 退化策略：用原始 t/d
+      lc = { base: clipStart, effective: clipLen, offset: 0 }
+      lm = { base: movieStart, effective: movLen,  offset: 0 }
     }
-    v.addEventListener('timeupdate', handler)
-    return handler
-  }
 
-  // 设置一对源并就位播放
-  const playPair = useCallback((clipStart:number, clipEnd:number, movieStart:number, movieEnd:number)=>{
-    const cv = clipRef.current, mv = movieRef.current
-    setRange({ clipStart, clipEnd, movieStart, movieEnd })
+    clipStartOffsetRef.current = Math.max(0, Number(lc.offset)||0)
+    movieStartOffsetRef.current = Math.max(0, Number(lm.offset)||0)
+
+    // 构造流 URL
+    const clipUrl  = `${backendBase}/video/clip?t=${Number(lc.base).toFixed(3)}&d=${Number(lc.effective).toFixed(3)}&pre=${preC}&post=${postC}`
+    const movieUrl = `${backendBase}/video/movie?t=${Number(lm.base).toFixed(3)}&d=${Number(lm.effective).toFixed(3)}&pre=${preM}&post=${postM}`
+
+    // 暂时禁用复用，确保 d 改变后浏览器真正拉取新的片段（避免看到旧的 duration）
+    const finalClipUrl = clipUrl
+    const finalMovieUrl = movieUrl
+
+    onSetSrc?.(finalClipUrl, finalMovieUrl)
+    lastClipUrlRef.current = finalClipUrl
+    lastMovieUrlRef.current = finalMovieUrl
+    lastClipBaseRef.current = Number(lc.base)
+    lastClipEffRef.current  = Number(lc.effective)
+    lastMovBaseRef.current  = Number(lm.base)
+    lastMovEffRef.current   = Number(lm.effective)
+
+    // 设定逻辑播放范围，供结束判断与进度条使用
+    rangeRef.current = { clipStart, clipEnd, movieStart, movieEnd }
     setLoopCount(0)
-    // 重置结束标志
-    endedClipRef.current = false
-    endedMovieRef.current = false
-    // 构造后端流URL：?t=xxx
-    const clipUrl = `${backendBase}/video/clip?t=${clipStart.toFixed(3)}`
-    const movieUrl = `${backendBase}/video/movie?t=${movieStart.toFixed(3)}`
-    // 交给外部设置 <video src>
-    onSetSrc?.(clipUrl, movieUrl)
 
-    // 由于是切片流，区间内 time 是从 0 开始
-    seekWhenReady(cv, 0); seekWhenReady(mv, 0)
+    // 强制暂停，避免边换源边播放引发的自动回到 0 的行为
+    pause()
 
-    // 重挂循环监听
-    detach()
-    clipHandlerRef.current = attachLoop(cv, 0, Math.max(0.01, clipEnd - clipStart), 'clip') || null
-    movieHandlerRef.current = attachLoop(mv, 0, Math.max(0.01, movieEnd - movieStart), 'movie') || null
+    // 初始 seek 到各自 offset（相对当前流从 0 开始）
+    const clipOffset  = Math.max(0, clipStartOffsetRef.current)
+    const movieOffset = Math.max(0, movieStartOffsetRef.current)
+    ensureSeek(clipRef.current,  clipOffset)
+    ensureSeek(movieRef.current, movieOffset)
 
-    // 播放
-    const playWhenReady = async ()=>{
-      const wait = (video: HTMLVideoElement)=> new Promise<void>(res=>{
-        if (video.readyState >= 3) res()
-        else {
-          const onCan = ()=>{ video.removeEventListener('canplay', onCan); res() }
-          video.addEventListener('canplay', onCan)
+    // 冷却 1.2s，忽略初始化阶段的 0-seek 噪声
+    suppressUntilRef.current = Date.now() + 1200
+
+    // 等待两端至少一次 seek 落到位（或超时兜底）后再播放
+    try {
+      if (clipRef.current)  await waitSeeked(clipRef.current,  clipOffset)
+      if (movieRef.current) await waitSeeked(movieRef.current, movieOffset)
+    } catch {}
+
+    await play()
+  }, [backendBase, clipRef, movieRef, onSetSrc, play, pause])
+
+  // RAF 轮询：仅在播放时检查是否到段尾，按 offset 回绕，并做节流
+  useEffect(()=>{
+    let raf = 0
+    const tick = ()=>{
+      const now = Date.now()
+      if (now < suppressUntilRef.current) { raf = requestAnimationFrame(tick); return }
+
+      const cv = clipRef.current, mv = movieRef.current
+      const r = rangeRef.current
+      if (!cv || !mv || !r || !syncPlay || !isPlaying) { raf = requestAnimationFrame(tick); return }
+
+      const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
+      const movLen  = Math.max(0.01, r.movieEnd - r.movieStart)
+
+      const cOff = clipStartOffsetRef.current
+      const mOff = movieStartOffsetRef.current
+
+      const cAtEnd = cv.currentTime >= cOff + clipLen - END_EPS
+      const mAtEnd = mv.currentTime >= mOff + movLen  - END_EPS
+
+      if (cAtEnd || mAtEnd) {
+        if (now - lastLoopAtRef.current > LOOP_THROTTLE_MS) {
+          lastLoopAtRef.current = now
+          const next = loopCount + 1
+          if (next <= Math.max(1, maxLoops)) {
+            try { cv.currentTime = cOff } catch {}
+            try { mv.currentTime = mOff } catch {}
+            try { cv.play() } catch {}
+            try { mv.play() } catch {}
+            setLoopCount(next)
+          } else {
+            pause()
+          }
         }
-      })
-      try {
-        if (cv) await wait(cv)
-        if (mv) await wait(mv)
-        await Promise.all([ cv?.play() || Promise.resolve(), mv?.play() || Promise.resolve() ])
-        setIsPlaying(true)
-      } catch {
-        try { cv?.play() } catch {}
-        try { mv?.play() } catch {}
-        setIsPlaying(true)
       }
+
+      raf = requestAnimationFrame(tick)
     }
-    if (syncPlay) playWhenReady()
-    else { try { cv?.play() } catch {}; try { mv?.play() } catch {}; setIsPlaying(true) }
-  }, [backendBase, clipRef, movieRef, syncPlay, onSetSrc, detach])
+    raf = requestAnimationFrame(tick)
+    return ()=> cancelAnimationFrame(raf)
+  }, [clipRef, movieRef, isPlaying, syncPlay, maxLoops, loopCount, pause])
 
-  const play = useCallback(()=>{
-    try { clipRef.current?.play() } catch {}
-    try { movieRef.current?.play() } catch {}
-    setIsPlaying(true)
-  }, [clipRef, movieRef])
-
-  const pause = useCallback(()=>{
-    clipRef.current?.pause()
-    movieRef.current?.pause()
-    setIsPlaying(false)
-  }, [clipRef, movieRef])
-
-  // 相对区间 seek：tRel ∈ [0, clipRange] 或 [0, movieRange]
-  const seekClipRel = useCallback((tRel: number)=>{
-    const cv = clipRef.current
-    if (!cv) return
-    try { cv.currentTime = Math.max(0, tRel) } catch {}
-    if (syncPlay){
-      const mv = movieRef.current
-      if (mv && range){
-        const clipLen = Math.max(0.01, (range.clipEnd - range.clipStart))
-        const movieLen = Math.max(0.01, (range.movieEnd - range.movieStart))
-        const ratio = Math.max(0, Math.min(1, tRel / clipLen))
-        const t2 = ratio * movieLen
-        try { mv.currentTime = t2 } catch {}
-      }
+  // 相对 seek：把滑块值映射到 offset
+  const seekClipRel = useCallback((tRel:number)=>{
+    const v = clipRef.current; const r = rangeRef.current; if (!v || !r) return
+    const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
+    const ratio = Math.max(0, Math.min(1, clipLen>0 ? tRel/clipLen : 0))
+    try { v.currentTime = clipStartOffsetRef.current + ratio * clipLen } catch {}
+    if (syncPlay) {
+      const mv = movieRef.current; if (!mv) return
+      const movLen = Math.max(0.01, r.movieEnd - r.movieStart)
+      try { mv.currentTime = movieStartOffsetRef.current + ratio * movLen } catch {}
     }
-  }, [clipRef, movieRef, syncPlay, range])
+  }, [clipRef, movieRef, syncPlay])
 
-  const seekMovieRel = useCallback((tRel: number)=>{
-    const mv = movieRef.current
-    if (!mv) return
-    try { mv.currentTime = Math.max(0, tRel) } catch {}
-    if (syncPlay){
-      const cv = clipRef.current
-      if (cv && range){
-        const clipLen = Math.max(0.01, (range.clipEnd - range.clipStart))
-        const movieLen = Math.max(0.01, (range.movieEnd - range.movieStart))
-        const ratio = Math.max(0, Math.min(1, tRel / movieLen))
-        const t2 = ratio * clipLen
-        try { cv.currentTime = t2 } catch {}
-      }
+  const seekMovieRel = useCallback((tRel:number)=>{
+    const v = movieRef.current; const r = rangeRef.current; if (!v || !r) return
+    const movLen = Math.max(0.01, r.movieEnd - r.movieStart)
+    const ratio = Math.max(0, Math.min(1, movLen>0 ? tRel/movLen : 0))
+    try { v.currentTime = movieStartOffsetRef.current + ratio * movLen } catch {}
+    if (syncPlay) {
+      const cv = clipRef.current; if (!cv) return
+      const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
+      try { cv.currentTime = clipStartOffsetRef.current + ratio * clipLen } catch {}
     }
-  }, [clipRef, movieRef, syncPlay, range])
+  }, [clipRef, movieRef, syncPlay])
 
   return {
     isPlaying,
     loopCount,
-    range,
+    range: rangeRef.current,
     playPair,
     play,
     pause,

@@ -1,6 +1,13 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react'
 import {openProject,listScenes,listSegments,applyChanges,save,rebuildScene, listOrigSegments} from '../api'
-import { formatTime, usePersistedState, useCandidates, usePlayerController, type Scene, type SegmentRow, type Candidate } from './logic'
+import { formatTime, usePersistedState, useCandidates, usePlayerController, type Scene, type SegmentRow } from './logic'
+
+/**
+ * NOTE:
+ * 初始定位、关键帧对齐、循环与同步播放完全由 usePlayerController (logic.ts) 负责。
+ * 这里不要在生命周期里对 <video>.currentTime 做任何“归零/重置”的操作，
+ * 只在进度条 onChange 时做用户驱动的 seek。
+ */
 
 const BACKEND_BASE = `${window.location.protocol}//${window.location.hostname}:8787`
 
@@ -15,15 +22,18 @@ export default function App(){
   const [allSegments,setAllSegments]=useState<SegmentRow[]>([])
   const [selectedSegId,setSelectedSegId]=useState<number|null>(null)
   const [selectedCandIdx,setSelectedCandIdx]=useState<number>(0)
+
   // 当前准备应用的候选（可能来自右侧候选列表，也可能来自“场景内原片段/走廊”面板）
   const [pendingChoice, setPendingChoice] = useState<{type:'cand'|'orig', data:any} | null>(null)
   // 当前选中段对应的“选中原片段”（用于避免候选列表异步刷新把 Movie 的时间顶掉）
   const [selectedMo, setSelectedMo] = useState<any|null>(null)
+
   const [followMovie,setFollowMovie]=useState<boolean>(true)
   const [loop,setLoop]=useState<boolean>(true)
   const [mirrorClip, setMirrorClip] = useState<boolean>(false)
   const [candMode, setCandMode] = useState<'top'|'scene'|'all'|'corridor'>('top')
   const { items: candList, total: candTotal } = useCandidates(selectedSegId, candMode, 120)
+
   const [origSegments, setOrigSegments] = useState<any[]>([])
   const [showOrigSegments, setShowOrigSegments] = useState<boolean>(false)
 
@@ -36,8 +46,6 @@ export default function App(){
   const clipRef = useRef<HTMLVideoElement|null>(null)
   const movieRef = useRef<HTMLVideoElement|null>(null)
 
-  // player refs above
-
   const [debug, setDebug] = useState<boolean>(true)
   const clipLastLogRef = useRef<number>(0)
   const movieLastLogRef = useRef<number>(0)
@@ -46,7 +54,8 @@ export default function App(){
   const [showDebugPanel, setShowDebugPanel] = useState<boolean>(true)
   const [overrides, setOverrides] = useState<any>(null)
   const [sceneHints, setSceneHints] = useState<Record<number, {scene_id:number, scene_seg_idx:number} | null>>({})
-    // 兼容 overrides 的 key 既可能是数字也可能是字符串
+
+  // 兼容 overrides 的 key 既可能是数字也可能是字符串
   const getOverrideForSeg = (segId: number) => {
     const d: any = overrides?.data || {}
     return d[segId] ?? d[String(segId)] ?? null
@@ -82,6 +91,7 @@ export default function App(){
       setSceneHints(prev=> ({ ...prev, [sceneId]: hint }))
     }catch(e){ console.error('ensureSceneHint failed', e) }
   }
+
   useEffect(()=>{
     if (!Array.isArray(scenes) || scenes.length===0) return
     const firstIds = scenes.slice(0, Math.min(20, scenes.length)).map(s=>s.clip_scene_id)
@@ -90,6 +100,9 @@ export default function App(){
 
   const [clipSrc, setClipSrc] = useState<string>(`${BACKEND_BASE}/video/clip`)
   const [movieSrc, setMovieSrc] = useState<string>(`${BACKEND_BASE}/video/movie`)
+  // 记录最近一次 src 变更时间，用于忽略播放器初始化造成的 seek(0)
+  const clipSrcChangedAtRef = useRef<number>(0)
+  const movieSrcChangedAtRef = useRef<number>(0)
   
   // 播放器同步和进度条状态
   const [syncPlay, setSyncPlay] = useState<boolean>(true)
@@ -97,44 +110,43 @@ export default function App(){
   const [clipDuration, setClipDuration] = useState<number>(0)
   const [movieCurrentTime, setMovieCurrentTime] = useState<number>(0)
   const [movieDuration, setMovieDuration] = useState<number>(0)
+
   // unified player controller
   const [maxLoops, setMaxLoops] = useState<number>(3)
-  const { isPlaying, loopCount, range, playPair, play: playSync, pause: pauseSync, seekClipRel, seekMovieRel } =
+  const { isPlaying, loopCount, range, playPair, play: playSync, pause: pauseSync, seekClipRel, seekMovieRel, getOffsets } =
     usePlayerController({
       clipRef,
       movieRef,
       backendBase: BACKEND_BASE,
       syncPlay,
-      maxLoops,
+      maxLoops: (loop ? maxLoops : 1),
       debug,
-      onSetSrc: (cUrl, mUrl) => { setClipSrc(cUrl); setMovieSrc(mUrl) }
+      onSetSrc: (cUrl, mUrl) => {
+        const now = Date.now()
+        clipSrcChangedAtRef.current = now
+        movieSrcChangedAtRef.current = now
+        setClipSrc(cUrl)
+        setMovieSrc(mUrl)
+      }
     })
   
-  // 当前播放的segment信息
-  // 播放状态管理
+  // 播放态 / 当前行
   const [playingSegId, setPlayingSegId] = useState<number | null>(null)
-  const [playingFromSide, setPlayingFromSide] = useState<'left' | 'right' | null>(null) // 记录播放来源
-  const [playingType, setPlayingType] = useState<'clip' | 'orig' | null>(null) // 记录播放类型
-  const [playingOrigSegId, setPlayingOrigSegId] = useState<number | null>(null) // 记录正在播放的原始segment ID
-  const [currentPlayingTimeRange, setCurrentPlayingTimeRange] = useState<{
-    clipStart: number,
-    clipEnd: number, 
-    movieStart: number,
-    movieEnd: number
-  } | null>(null) // 记录当前播放的时间范围
-  
-  // 当前校对的clip segment信息
+  const [playingFromSide, setPlayingFromSide] = useState<'left' | 'right' | null>(null)
+  const [playingType, setPlayingType] = useState<'clip' | 'orig' | null>(null)
+  const [playingOrigSegId, setPlayingOrigSegId] = useState<number | null>(null)
+
+  // 当前校对的 clip 段
   const [currentClipSegment, setCurrentClipSegment] = useState<{
     segId: number,
     clipStart: number,
     clipEnd: number,
     sceneId?: number,
     sceneSegIdx?: number
-  } | null>(null) // 记录当前正在校对的clip segment信息
+  } | null>(null)
 
-  // 最近一次 seek 的来源：用于避免左侧点击后被自动 useEffect 立即覆盖
+  // 最近一次 seek 的来源：用于避免被自动 useEffect 覆盖
   const lastSeekByRef = useRef<'left'|'right'|'auto'|null>(null)
-  
 
   async function refreshScenes(){
     try {
@@ -156,7 +168,6 @@ export default function App(){
       if (allSegs && allSegs.length) {
         const firstSeg = allSegs[0]
         setSelectedSegId(firstSeg.seg_id)
-        // 初始化当前校对的clip segment信息
         setCurrentClipSegment({
           segId: firstSeg.seg_id,
           clipStart: firstSeg.clip.start ?? 0,
@@ -182,22 +193,17 @@ export default function App(){
     ])
   }
 
-  // load segments when selection changes
+  // selection -> load scene rows
   useEffect(()=>{
     if(selectedSegId != null){
-      // 当选择了 seg_id 时，从 allSegments 中找到对应的段落
       const selectedSeg = allSegments.find(s => s.seg_id === selectedSegId)
       if (selectedSeg) {
-        // 设置当前活动场景为该段落所属的场景
         setActiveScene(selectedSeg.clip.scene_id || null)
-        // 设置默认的“当前原片段”为服务端已应用的匹配
         const merged = (selectedSeg as any).matched_orig_seg || null
         setSelectedMo(merged)
-        // 加载该场景的所有段落
         if (selectedSeg.clip.scene_id != null) {
           listSegments(selectedSeg.clip.scene_id).then(arr=>{
             setSegments(arr)
-            // remove loadCandidates
           }).catch(e => {
             console.error('Failed to load segments', e)
           })
@@ -209,55 +215,30 @@ export default function App(){
   // 加载原始段落数据 (当前场景及前后场景)
   async function loadOrigSegments(sceneId: number) {
     try {
-      const promises = []
-      const sceneIds = []
-      
-      // 加载前两个场景
+      const promises:any[] = []
+      const sceneIds:number[] = []
       for (let i = sceneId - 2; i <= sceneId + 2; i++) {
-        if (i > 0) { // 只加载有效的场景ID
-          promises.push(listOrigSegments(i))
-          sceneIds.push(i)
-        }
+        if (i > 0) { promises.push(listOrigSegments(i)); sceneIds.push(i) }
       }
-      
       const responses = await Promise.all(promises)
-      
-      // 合并所有场景的segments，并添加场景标识
-      const allSegments = []
+      const merged:any[] = []
       responses.forEach((resp, idx) => {
-        const segments = resp.segments || []
-        segments.forEach((seg: any) => {
-          allSegments.push({
-            ...seg,
-            _sceneId: sceneIds[idx], // 添加场景标识
-            _isCurrentScene: sceneIds[idx] === sceneId // 标识是否为当前场景
-          })
-        })
+        const segs = resp?.segments || []
+        segs.forEach((seg:any)=> merged.push({ ...seg, _sceneId: sceneIds[idx], _isCurrentScene: sceneIds[idx]===sceneId }))
       })
-      
-      // 按场景ID和segment索引排序
-      allSegments.sort((a, b) => {
-        if (a._sceneId !== b._sceneId) {
-          return a._sceneId - b._sceneId
-        }
-        return (a.scene_seg_idx || 0) - (b.scene_seg_idx || 0)
-      })
-      
-      setOrigSegments(allSegments)
+      merged.sort((a,b)=> a._sceneId!==b._sceneId ? a._sceneId-b._sceneId : (a.scene_seg_idx||0)-(b.scene_seg_idx||0))
+      setOrigSegments(merged)
     } catch (e) {
       console.error('Failed to load orig segments', e)
       setOrigSegments([])
     }
   }
 
-  // 加载走廊：以锚点 scene_id 为基准，prev=向后取、next=向前取相邻原片场景
+  // 加载走廊
   async function loadCorridorFor(anchorSceneId: number, dir: 'prev'|'next', n = CORRIDOR_N){
     const ids: number[] = []
-    if (dir === 'prev'){
-      for (let s = anchorSceneId + 1; s <= anchorSceneId + n; s++) ids.push(s)
-    } else {
-      for (let s = anchorSceneId - n; s <= anchorSceneId - 1; s++) if (s > 0) ids.push(s)
-    }
+    if (dir === 'prev'){ for (let s = anchorSceneId + 1; s <= anchorSceneId + n; s++) ids.push(s) }
+    else { for (let s = anchorSceneId - n; s <= anchorSceneId - 1; s++) if (s > 0) ids.push(s) }
     const all: any[] = []
     for (const sid of ids){
       if (!corridorCacheRef.current.has(sid)){
@@ -277,7 +258,7 @@ export default function App(){
     return allSegments.find(s=>s.seg_id===selectedSegId) || segments.find(s=>s.seg_id===selectedSegId)
   },[allSegments, segments, selectedSegId])
 
-  // 当选择"场景内"模式时加载原始段落
+  // candMode=scene 时，加载原片段
   useEffect(() => {
     if (candMode === 'scene' && selectedRow?.matched_orig_seg?.scene_id) {
       loadOrigSegments(selectedRow.matched_orig_seg.scene_id)
@@ -287,19 +268,15 @@ export default function App(){
     }
   }, [candMode, selectedRow])
 
-  // 当选择变化时，基于前/后 clip 场景的原片锚点，加载走廊
+  // 选择变化 -> 基于相邻 clip 场景的锚点 scene，加载走廊
   useEffect(()=>{
     if (!selectedRow) return
     const cid = selectedRow.clip?.scene_id
     if (cid == null) return
-
-    // 取所有 clip 场景 id，去重排序
     const sceneIds = Array.from(new Set(allSegments.map(s=>s.clip?.scene_id).filter((x:any)=>x!=null))).sort((a:any,b:any)=>a-b)
     const idx = sceneIds.indexOf(cid)
     const prevCid = idx>0 ? sceneIds[idx-1] : null
     const nextCid = (idx>=0 && idx<sceneIds.length-1) ? sceneIds[idx+1] : null
-
-    // 从 sceneHints 或首行匹配里取锚点原片 scene_id
     const anchorFromClipScene = (clipSceneId:number|null)=>{
       if (!clipSceneId) return null
       const hint = sceneHints[clipSceneId]
@@ -308,16 +285,14 @@ export default function App(){
       const mo:any = firstRow?.matched_orig_seg || firstRow?.top_matches?.[0]
       return mo?.scene_id ?? null
     }
-
     const anchorPrev = anchorFromClipScene(prevCid)
     const anchorNext = anchorFromClipScene(nextCid)
-
     setCorridorPrev([]); setCorridorNext([])
     if (anchorPrev) loadCorridorFor(anchorPrev, 'prev', CORRIDOR_N)
     if (anchorNext) loadCorridorFor(anchorNext, 'next', CORRIDOR_N)
   }, [selectedRow, allSegments, sceneHints])
 
-  // Seek videos to the currently selected row (clip uses clip times, movie uses current choice/candidate)
+  // 将当前选中行定位到播放器（clip=行时间，movie=候选/匹配）
   function seekTo(row?: SegmentRow, candIdx?: number){
     const r = row || selectedRow
     if (!r) return
@@ -326,21 +301,18 @@ export default function App(){
     let mo: any = selectedMo || (r as any).matched_orig_seg || {}
     const cand = (candList && candList[candIdx ?? selectedCandIdx]) || ((r.top_matches && r.top_matches[candIdx ?? selectedCandIdx]) || null)
     const hasOv = !!(r as any).is_override
-    // 只有在“没有覆盖”和“没有手动选择 selectedMo”的情况下才允许跟随候选
     if (!selectedMo && followMovie && !hasOv && cand) mo = cand
     const movStart = mo?.start ?? 0
     const movEnd   = mo?.end   ?? (movStart + 2)
     playPair(clipStart, clipEnd, movStart, movEnd)
-    // 更新播放态用于高亮
     setPlayingSegId(r.seg_id)
     setPlayingFromSide('left')
     setPlayingType('clip')
     setPlayingOrigSegId(mo?.seg_id ?? null)
-    // 维护当前校对段信息（供右侧使用）
     setCurrentClipSegment({ segId: r.seg_id, clipStart, clipEnd, sceneId: r.clip.scene_id, sceneSegIdx: r.clip.scene_seg_idx })
   }
 
-  // 左侧列表点击播放：严格使用服务端匹配；播放中点击直接忽略
+  // 左侧点击播放（播放中点击忽略）
   function seekFromLeft(seg: SegmentRow){
     if (isPlaying){ dlog('left click ignored: playing'); return }
     const clipStart = seg.clip?.start ?? 0
@@ -350,22 +322,14 @@ export default function App(){
     const movStart = mo?.start ?? 0
     const movEnd   = mo?.end   ?? (movStart + 2)
     lastSeekByRef.current = 'left'
-    // 使用统一控制器
     playPair(clipStart, clipEnd, movStart, movEnd)
-    // 选中并高亮播放态
     setSelectedSegId(seg.seg_id)
     setPlayingSegId(seg.seg_id)
     setPlayingFromSide('left')
     setPlayingType('clip')
     setPlayingOrigSegId(mo?.seg_id ?? null)
     setPendingChoice(null)
-    setCurrentClipSegment({
-      segId: seg.seg_id,
-      clipStart,
-      clipEnd,
-      sceneId: seg.clip.scene_id,
-      sceneSegIdx: seg.clip.scene_seg_idx
-    })
+    setCurrentClipSegment({ segId: seg.seg_id, clipStart, clipEnd, sceneId: seg.clip.scene_id, sceneSegIdx: seg.clip.scene_seg_idx })
   }
 
   function seekToOrigSegment(origSeg: any) {
@@ -374,12 +338,12 @@ export default function App(){
     const clipEnd   = currentClipSegment.clipEnd
     const movStart  = origSeg.start ?? 0
     const movEnd    = origSeg.end   ?? (movStart + 2)
+    lastSeekByRef.current = 'right'
     playPair(clipStart, clipEnd, movStart, movEnd)
     setPlayingSegId(currentClipSegment.segId)
     setPlayingFromSide('right')
     setPlayingType('orig')
     setPlayingOrigSegId(origSeg.seg_id ?? null)
-    // 将原片段映射为 candidate-like 数据，便于 apply 使用
     const mapped = {
       seg_id: origSeg.seg_id,
       scene_seg_idx: origSeg.scene_seg_idx,
@@ -413,44 +377,43 @@ export default function App(){
     setPlayingOrigSegId(candidate.seg_id ?? null)
   }
 
-  // When selection or candidate selection changes, seek
+  // 计算当前候选的唯一 key，减少 spurious auto-seek
+  const currentCandKey = useMemo(()=>{
+    const c:any = candList?.[selectedCandIdx]
+    return c ? `${c.seg_id}-${c.start}-${c.end}` : 'none'
+  }, [candList, selectedCandIdx])
+  //（关键）当 selection 或候选改变时触发自动 seek；若刚刚由点击触发，则跳过一次，避免覆盖
   useEffect(()=>{
-    if (lastSeekByRef.current === 'left') { // 左侧点击刚刚触发过精确 seek，避免被自动 seek 覆盖
-      lastSeekByRef.current = null
-      return
-    }
+    if (lastSeekByRef.current){ lastSeekByRef.current = null; return }
     seekTo()
-  },[selectedSegId, selectedCandIdx, followMovie, candList])
+  },[selectedSegId, selectedCandIdx, followMovie, currentCandKey])
 
-  // Accept selected candidate for selected row
+  // 应用候选
   async function acceptSelected(){
     const r = selectedRow
     if (!r) { console.warn('[apply] no selected row'); return }
-
-    // 优先使用 pendingChoice（可能来自场景内原片段/走廊）；其次回退到当前候选列表；再回退 row.top_matches
     const fromPending = pendingChoice?.data
     const fromCandList = (candList && candList[selectedCandIdx]) || null
     const fromRowTop = (r.top_matches && r.top_matches[selectedCandIdx]) || null
     const chosen = fromPending || fromCandList || fromRowTop
-
     if (!chosen){ console.warn('[apply] no candidate to apply'); return }
-
     const change = { seg_id: r.seg_id, chosen }
-
     try{
       console.log('[apply] sending change', change)
       await applyChanges([change])
 
-      // 本地乐观更新：更新中间表（segments）里该行
+      // 本地乐观更新
       setSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}, is_override: true, matched_source: 'applied'}) : row) : prev)
-      // 也更新左侧 allSegments（段落列表）以保持一致
       setAllSegments(prev => Array.isArray(prev) ? prev.map(row => row.seg_id===r.seg_id ? ({...row, matched_orig_seg: {...chosen}, is_override: true, matched_source: 'applied'}) : row) : prev)
 
-      // 乐观更新本地 overrides，立即点亮左侧 ✓ 标记（保留以便调试面板查看）
+      // 点亮覆盖
       setOverrides(prev => {
         const data = { ...(prev?.data || {}), [String(r.seg_id)]: { ...chosen } }
         return { ...(prev || {}), data, count: Object.keys(data).length }
       })
+
+      // 确保 UI 后续跟随覆盖
+      setSelectedMo(chosen)
 
       console.log('[apply] applied on seg', r.seg_id, '->', chosen)
       await refreshOverrides()
@@ -460,12 +423,10 @@ export default function App(){
     }
   }
 
-  // Scene level rebuild
+  // 场景级重建
   async function doRebuild(){
     if (activeScene==null) return
     await rebuildScene(activeScene)
-    
-    // 重新加载所有数据
     await refreshScenes()
     await refreshOverrides()
   }
@@ -591,30 +552,48 @@ export default function App(){
                      //if (!syncPlay) setIsPlaying(false)
                    }}
                    onSeeking={e=>{ 
-                     if (debug) console.log('[Clip] seeking to', e.currentTarget.currentTime) 
+                     const t = e.currentTarget.currentTime
+                     // 忽略 src 更新后浏览器自动触发的 seek(0)
+                     if (Date.now() - (clipSrcChangedAtRef.current||0) < 1500 && t < 0.2) return
+                     if (debug) console.log('[Clip] seeking to', t)
                    }}
-                   onSeeked={e=>{ if (debug) console.log('[Clip] seeked to', e.currentTarget.currentTime) }}
+                   onSeeked={e=>{ 
+                     const t = e.currentTarget.currentTime
+                     if (Date.now() - (clipSrcChangedAtRef.current||0) < 1500 && t < 0.2) return
+                     if (debug) console.log('[Clip] seeked to', t)
+                   }}
                    onError={e=>{ console.error('[Clip] error', e) }}
             />
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
-                <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
-                  { range ? `${formatTime(range.clipStart + clipCurrentTime)} / ${formatTime(range.clipEnd)}`
-                          : `${formatTime((selectedRow?.clip?.start ?? 0) + clipCurrentTime)} / ${formatTime(selectedRow?.clip?.end ?? (selectedRow?.clip?.start ?? 0) + clipDuration)}` }
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={range ? Math.max(0.01, range.clipEnd - range.clipStart) : (clipDuration || 1)}
-                  step={0.1}
-                  value={clipCurrentTime}
-                  onChange={(e) => {
-                    const t = parseFloat(e.target.value)
-                    if (clipRef.current) clipRef.current.currentTime = t
-                    seekClipRel(t)
-                  }}
-                  style={{width: '100%'}}
-                />
+                {(() => {
+                  const { clipOffset } = getOffsets()
+                  const relClipTime = Math.max(0, clipCurrentTime - clipOffset)
+                  const clipLen = range ? Math.max(0.01, range.clipEnd - range.clipStart) : (clipDuration || 1)
+                  return (
+                    <>
+                      <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
+                        { range
+                          ? `${formatTime(range.clipStart + relClipTime)} / ${formatTime(range.clipEnd)}`
+                          : `${formatTime(relClipTime)} / ${formatTime(clipLen)}`
+                        }
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={clipLen}
+                        step={0.1}
+                        value={relClipTime}
+                        onChange={(e) => {
+                          const t = parseFloat(e.target.value)
+                          if (clipRef.current) clipRef.current.currentTime = (clipOffset + t)
+                          seekClipRel(t)
+                        }}
+                        style={{width: '100%'}}
+                      />
+                    </>
+                  )
+                })()}
               </div>
             )}
           </div>
@@ -643,40 +622,47 @@ export default function App(){
                      //if (!syncPlay) setIsPlaying(false)
                    }}
                    onSeeking={e=>{ 
-                     if (debug) console.log('[Movie] seeking to', e.currentTarget.currentTime) 
+                     const t = e.currentTarget.currentTime
+                     if (Date.now() - (movieSrcChangedAtRef.current||0) < 1500 && t < 0.2) return
+                     if (debug) console.log('[Movie] seeking to', t) 
                    }}
-                   onSeeked={e=>{ if (debug) console.log('[Movie] seeked to', e.currentTarget.currentTime) }}
+                   onSeeked={e=>{ 
+                     const t = e.currentTarget.currentTime
+                     if (Date.now() - (movieSrcChangedAtRef.current||0) < 1500 && t < 0.2) return
+                     if (debug) console.log('[Movie] seeked to', t)
+                   }}
                    onError={e=>{ console.error('[Movie] error', e) }}
             />
             {syncPlay && selectedRow && (
               <div style={{marginTop: 4}}>
-                <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
-                  { range ? `${formatTime(range.movieStart + movieCurrentTime)} / ${formatTime(range.movieEnd)}` 
-                  : (()=>{ 
-                      if (!selectedRow) return `${formatTime(0)} / ${formatTime(movieDuration)}`
-                      const hasOv = !!(selectedRow as any).is_override
-                      let mo:any = selectedMo || (selectedRow as any).matched_orig_seg || {}
-                      if (!selectedMo && followMovie && !hasOv && candList) {
-                        const c = candList[selectedCandIdx]
-                        if (c) mo = c
-                      }
-                      const ms=mo?.start??0; const me=mo?.end??(ms+movieDuration)
-                      return `${formatTime(ms + movieCurrentTime)} / ${formatTime(me)}`
-                    })() }
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={range ? Math.max(0.01, range.movieEnd - range.movieStart) : (movieDuration || 1)}
-                  step={0.1}
-                  value={movieCurrentTime}
-                  onChange={(e) => {
-                    const t = parseFloat(e.target.value)
-                    if (movieRef.current) movieRef.current.currentTime = t
-                    seekMovieRel(t)
-                  }}
-                  style={{width: '100%'}}
-                />
+                {(() => {
+                  const { movieOffset } = getOffsets()
+                  const relMovieTime = Math.max(0, movieCurrentTime - movieOffset)
+                  const movLen = range ? Math.max(0.01, range.movieEnd - range.movieStart) : (movieDuration || 1)
+                  return (
+                    <>
+                      <div style={{fontSize: 11, opacity: 0.7, marginBottom: 2}}>
+                        { range
+                          ? `${formatTime(range.movieStart + relMovieTime)} / ${formatTime(range.movieEnd)}`
+                          : `${formatTime(relMovieTime)} / ${formatTime(movLen)}`
+                        }
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={movLen}
+                        step={0.1}
+                        value={relMovieTime}
+                        onChange={(e) => {
+                          const t = parseFloat(e.target.value)
+                          if (movieRef.current) movieRef.current.currentTime = (movieOffset + t)
+                          seekMovieRel(t)
+                        }}
+                        style={{width: '100%'}}
+                      />
+                    </>
+                  )
+                })()}
               </div>
             )}
           </div>

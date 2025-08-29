@@ -10,6 +10,188 @@ from .schemas import OpenProjectReq, ApplyBatchReq, SaveReq
 from .utils import group_by_clip_scene
 from pathlib import Path
 import json
+from typing import List, Tuple
+
+# --- keyframes helpers --------------------------------------------------------
+
+def _kf_path(kind: str) -> Path:
+    root = Path(STATE.project_root or ".")
+    name = f"{kind}_keyframes.json"
+    return root / name
+
+
+def _ffprobe_keyframes(input_path: str) -> List[float]:
+    """Return list of keyframe timestamps (seconds) for the first video stream.
+    Tries several ffprobe strategies for robustness:
+      1) frames + -skip_frame nokey (lightweight) using best_effort_timestamp_time
+      2) frames (all) filter key_frame==1 or pict_type==I
+      3) packets filter flags contains 'K'
+    """
+    def _unique_sorted(vals: List[float]) -> List[float]:
+        out = sorted(set(float(x) for x in vals if x is not None))
+        # ensure 0.0 exists
+        if not out or out[0] > 0.0:
+            out = [0.0] + out
+        return out
+
+    # Strategy 1: only keyframes via decoder skip, JSON frames
+    try:
+        cmd1 = [
+            "ffprobe", "-v", "error",
+            "-skip_frame", "nokey",
+            "-select_streams", "v:0",
+            "-show_frames",
+            "-show_entries", "frame=best_effort_timestamp_time,pkt_pts_time",
+            "-of", "json",
+            input_path,
+        ]
+        out1 = subprocess.check_output(cmd1, stderr=subprocess.STDOUT)
+        data1 = json.loads(out1.decode("utf-8", errors="ignore"))
+        vals1: List[float] = []
+        for fr in (data1.get("frames") or []):
+            ts = fr.get("best_effort_timestamp_time") or fr.get("pkt_pts_time")
+            if ts is None:
+                continue
+            try:
+                vals1.append(float(ts))
+            except Exception:
+                pass
+        if len(vals1) > 1:
+            return _unique_sorted(vals1)
+    except Exception:
+        pass
+
+    # Strategy 2: all frames, filter key_frame==1 or pict_type==I
+    try:
+        cmd2 = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_frames",
+            "-show_entries", "frame=key_frame,pict_type,best_effort_timestamp_time,pkt_pts_time",
+            "-of", "json",
+            input_path,
+        ]
+        out2 = subprocess.check_output(cmd2, stderr=subprocess.STDOUT)
+        data2 = json.loads(out2.decode("utf-8", errors="ignore"))
+        vals2: List[float] = []
+        for fr in (data2.get("frames") or []):
+            try:
+                is_k = int(fr.get("key_frame") or 0) == 1
+            except Exception:
+                is_k = False
+            pict = (fr.get("pict_type") or "").upper()
+            if is_k or pict == "I":
+                ts = fr.get("best_effort_timestamp_time") or fr.get("pkt_pts_time")
+                if ts is None:
+                    continue
+                try:
+                    vals2.append(float(ts))
+                except Exception:
+                    pass
+        if len(vals2) > 1:
+            return _unique_sorted(vals2)
+    except Exception:
+        pass
+
+    # Strategy 3: packets, filter flags contains 'K'
+    try:
+        cmd3 = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_packets",
+            "-show_entries", "packet=pts_time,flags",
+            "-of", "json",
+            input_path,
+        ]
+        out3 = subprocess.check_output(cmd3, stderr=subprocess.STDOUT)
+        data3 = json.loads(out3.decode("utf-8", errors="ignore"))
+        vals3: List[float] = []
+        for pk in (data3.get("packets") or []):
+            flags = str(pk.get("flags") or "")
+            if "K" in flags.upper():
+                ts = pk.get("pts_time")
+                if ts is None:
+                    continue
+                try:
+                    vals3.append(float(ts))
+                except Exception:
+                    pass
+        if len(vals3) > 1:
+            return _unique_sorted(vals3)
+    except Exception:
+        pass
+
+    # Fallback
+    return [0.0]
+
+
+def _save_keyframes(kind: str, src_path: str, kf_list: List[float]) -> Path:
+    p = _kf_path(kind)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    obj = {
+        "source": src_path,
+        "count": len(kf_list),
+        "keyframes": kf_list,
+    }
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+    return p
+
+
+def _load_keyframes(kind: str) -> List[float]:
+    p = _kf_path(kind)
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            arr = obj.get("keyframes") if isinstance(obj, dict) else None
+            if isinstance(arr, list):
+                return [float(x) for x in arr]
+        except Exception:
+            pass
+    return []
+
+
+def _ensure_keyframes(kind: str) -> List[float]:
+    # in-memory cache on STATE
+    if not hasattr(STATE, "keyframes"):
+        STATE.keyframes = {}
+    cache: dict = getattr(STATE, "keyframes")
+    if kind in cache and isinstance(cache[kind], list) and cache[kind]:
+        return cache[kind]
+    path = (STATE.paths or {}).get(kind)
+    if not path or not Path(path).exists():
+        cache[kind] = [0.0]
+        return cache[kind]
+    kf = _load_keyframes(kind)
+    if not kf or len(kf) <= 1:
+        kf = _ffprobe_keyframes(path)
+        _save_keyframes(kind, path, kf)
+    cache[kind] = kf
+    return kf
+
+
+def _locate_chunk(kind: str, t: float, d: float, pre: float, post: float) -> Tuple[float, float, float]:
+    """Given target start t and duration d, return (base, effective, offset).
+    base is the chosen keyframe-aligned start; effective is total chunk duration;
+    offset is (t - base) clipped to [0, effective].
+    """
+    kf = _ensure_keyframes(kind)
+    # choose keyframe <= t - pre, else 0.0
+    t_pre = max(0.0, (t or 0.0) - max(0.0, pre))
+    base = 0.0
+    for x in kf:
+        if x <= t_pre:
+            base = x
+        else:
+            break
+    # ensure we cover till t + d + post
+    end_need = max(t, 0.0) + max(d, 0.0) + max(post, 0.0)
+    effective = max(0.1, end_need - base)
+    offset = max(0.0, min(effective, (t or 0.0) - base))
+    return base, effective, offset
 
 # --- overrides sidecar helpers -------------------------------------------------
 
@@ -107,28 +289,80 @@ def open_project(req: OpenProjectReq):
     STATE.load_project(req.root, req.movie_path, req.clip_path)
     STATE.build_explain_offsets()
     _load_overrides_into_state()
+    # Precompute and persist keyframes (movie & clip) for faster, accurate seeks
+    try:
+        if STATE.paths.get("movie"):
+            _ensure_keyframes("movie")
+        if STATE.paths.get("clip"):
+            _ensure_keyframes("clip")
+    except Exception:
+        pass
     scenes = _scenes_summary()
     return {"ok": True, "scenes": scenes, "paths": STATE.paths}
 
+
+# Expose keyframes for debugging or front-end
+@app.get("/keyframes")
+def keyframes(kind: str = Query("movie"), force: int = Query(0)):
+    if force:
+        path = (STATE.paths or {}).get(kind)
+        if not path or not Path(path).exists():
+            raise HTTPException(404, f"{kind} not set")
+        kf = _ffprobe_keyframes(path)
+        _save_keyframes(kind, path, kf)
+        # refresh in-memory cache
+        if not hasattr(STATE, "keyframes"):
+            STATE.keyframes = {}
+        STATE.keyframes[kind] = kf
+    else:
+        kf = _ensure_keyframes(kind)
+    return {"ok": True, "kind": kind, "count": len(kf), "keyframes": kf[:2000]}
+
 @app.get("/video/movie")
-def video_movie(t: float | None = Query(None)):
+def video_movie(t: float | None = Query(None), d: float | None = Query(None), pre: float = Query(0.8), post: float = Query(0.8)):
     p = STATE.paths.get("movie")
     if not p or not Path(p).exists():
         raise HTTPException(404, "movie not set")
     if t is None:
-        # 原样返回完整文件（不支持拖动，但可用于小文件或兜底）
         return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
-    # 从 t 秒起播（推荐）
-    return stream_mp4_from_time(p, t)
+    # chunked streaming aligned to keyframe
+    d_eff = float(d if d is not None else 2.0)
+    base, effective, offset = _locate_chunk("movie", float(t), d_eff, pre, post)
+    resp = stream_mp4_chunk(p, base, effective)
+    # attach locating headers
+    try:
+        resp.headers["X-Base-Start"] = f"{base:.3f}"
+        resp.headers["X-Effective-Duration"] = f"{effective:.3f}"
+        resp.headers["X-Offset"] = f"{offset:.3f}"
+    except Exception:
+        pass
+    return resp
 
 @app.get("/video/clip")
-def video_clip(t: float | None = Query(None)):
+def video_clip(t: float | None = Query(None), d: float | None = Query(None), pre: float = Query(0.2), post: float = Query(0.2)):
     p = STATE.paths.get("clip")
     if not p or not Path(p).exists():
         raise HTTPException(404, "clip not set")
     if t is None:
         return FileResponse(p, media_type="video/mp4", filename=Path(p).name)
-    return stream_mp4_from_time(p, t)
+    d_eff = float(d if d is not None else 2.0)
+    base, effective, offset = _locate_chunk("clip", float(t), d_eff, pre, post)
+    resp = stream_mp4_chunk(p, base, effective)
+    try:
+        resp.headers["X-Base-Start"] = f"{base:.3f}"
+        resp.headers["X-Effective-Duration"] = f"{effective:.3f}"
+        resp.headers["X-Offset"] = f"{offset:.3f}"
+    except Exception:
+        pass
+    return resp
+
+# Endpoint to locate chunk info for a time/duration
+@app.get("/video/locate")
+def video_locate(kind: str = Query("movie"), t: float = Query(...), d: float = Query(2.0), pre: float = Query(0.8), post: float = Query(0.8)):
+    if kind not in ("movie", "clip"):
+        raise HTTPException(400, "kind must be 'movie' or 'clip'")
+    base, effective, offset = _locate_chunk(kind, t, d, pre, post)
+    return {"ok": True, "kind": kind, "t": t, "d": d, "base": base, "effective": effective, "offset": offset}
 
 def stream_mp4_from_time(path: str, t: float):
     """
@@ -163,6 +397,45 @@ def stream_mp4_from_time(path: str, t: float):
     headers = {
         "Cache-Control": "no-store",
         "Accept-Ranges": "bytes",
+    }
+    return StreamingResponse(proc.stdout, media_type="video/mp4", headers=headers, background=BackgroundTask(_cleanup))
+
+# Streaming helper for chunked aligned streaming
+def stream_mp4_chunk(path: str, base: float, duration: float):
+    """Stream an fMP4 chunk starting at keyframe-aligned 'base' for 'duration' seconds.
+    Uses -c copy with reset timestamps so the fragment timeline starts at 0.
+    """
+    if not os.path.exists(path):
+        raise HTTPException(404, "file not found")
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(0.0, base):.3f}",
+        "-i", path,
+        "-t", f"{max(0.1, duration):.3f}",
+        "-reset_timestamps", "1", "-start_at_zero", "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart+frag_keyframe+empty_moov",
+        "-c", "copy",
+        "-f", "mp4", "-",
+    ]
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE)
+    except FileNotFoundError:
+        raise HTTPException(500, "ffmpeg not found; please install ffmpeg and ensure it's in PATH")
+    if not proc.stdout:
+        raise HTTPException(500, "ffmpeg no stdout")
+
+    def _cleanup():
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    headers = {
+        "Cache-Control": "public, max-age=3600",
+        "Accept-Ranges": "bytes",
+        # front-end can read these to compute relative seek within the chunk
+        "Access-Control-Expose-Headers": "X-Base-Start, X-Effective-Duration, X-Offset",
     }
     return StreamingResponse(proc.stdout, media_type="video/mp4", headers=headers, background=BackgroundTask(_cleanup))
 
@@ -310,6 +583,7 @@ def candidates(seg_id: int = Query(...), mode: str = Query("top"), k: int = Quer
       - top:   use row.top_matches only
       - scene: filter candidates to same movie scene as the current *applied* (or matched) choice
       - all:   applied (if any) + matched + top_matches, de-duplicated
+    New chunked video streaming modes available (see /video/movie, /video/clip endpoints).
     """
     row = _find_seg_row(seg_id)
     if not row:
