@@ -145,6 +145,32 @@ export function usePlayerController(opts: PlayerOpts){
   const lastMovBaseRef  = useRef<number | null>(null)
   const lastMovEffRef   = useRef<number | null>(null)
 
+  // 轻量定位缓存（降低同一段短时间内重复 locate 带来的抖动）
+  const locateCacheRef = useRef<Map<string, {base:number, effective:number, offset:number, ts:number}>>(new Map())
+  const LOCATE_TTL_MS = 2000
+
+  // 并发保护：只让最新的一次 playPair 生效
+  const actionIdRef = useRef(0)
+
+  const locate = async (kind:'clip'|'movie', t:number, d:number, pre:number, post:number)=>{
+    // 归一化 key，避免浮点毛刺导致缓存失效
+    const key = `${kind}:${t.toFixed(3)}:${d.toFixed(3)}:${pre}:${post}`
+    const now = Date.now()
+    const cache = locateCacheRef.current
+    const hit = cache.get(key)
+    if (hit && (now - hit.ts) < LOCATE_TTL_MS){
+      if (debug) console.log('[locate:cache]', key, hit)
+      return { base: hit.base, effective: hit.effective, offset: hit.offset }
+    }
+    const qs = new URLSearchParams({ kind, t:String(t), d:String(d), pre:String(pre), post:String(post) })
+    const r = await fetch(`${backendBase}/video/locate?`+qs.toString())
+    const j = await r.json()
+    if (debug) console.log('[locate]', j)
+    const rec = { base: Number(j.base)||t, effective: Number(j.effective)||d, offset: Number(j.offset)||0, ts: now }
+    cache.set(key, rec)
+    return { base: rec.base, effective: rec.effective, offset: rec.offset }
+  }
+
   const play = useCallback(async ()=>{
     try {
       await clipRef.current?.play()
@@ -159,15 +185,6 @@ export function usePlayerController(opts: PlayerOpts){
   const pause = useCallback(()=>{
     clipRef.current?.pause(); movieRef.current?.pause(); setIsPlaying(false)
   }, [clipRef, movieRef])
-
-  // 定位接口（服务端返回 base/effective/offset）
-  const locate = async (kind:'clip'|'movie', t:number, d:number, pre:number, post:number)=>{
-    const qs = new URLSearchParams({ kind, t:String(t), d:String(d), pre:String(pre), post:String(post) })
-    const r = await fetch(`${backendBase}/video/locate?`+qs.toString())
-    const j = await r.json()
-    if (debug) console.log('[locate]', j)
-    return j as { ok?:boolean, base:number, effective:number, offset:number }
-  }
 
   const waitSeeked = (v: HTMLVideoElement, target: number, eps = 0.05, timeoutMs = 1200) => new Promise<void>((resolve) => {
     let done = false
@@ -198,6 +215,8 @@ export function usePlayerController(opts: PlayerOpts){
   }
 
   const playPair = useCallback(async (clipStart:number, clipEnd:number, movieStart:number, movieEnd:number)=>{
+    const myId = ++actionIdRef.current
+
     const clipLen = Math.max(0.01, clipEnd - clipStart)
     const movLen  = Math.max(0.01, movieEnd - movieStart)
 
@@ -211,11 +230,13 @@ export function usePlayerController(opts: PlayerOpts){
         locate('clip',  clipStart, clipLen, preC, postC),
         locate('movie', movieStart, movLen,  preM, postM),
       ])
-    } catch (e) {
-      // 退化策略：用原始 t/d
+    } catch {
       lc = { base: clipStart, effective: clipLen, offset: 0 }
       lm = { base: movieStart, effective: movLen,  offset: 0 }
     }
+
+    // 如果期间有更新的 playPair 抢先了，放弃本次
+    if (myId !== actionIdRef.current) return
 
     clipStartOffsetRef.current = Math.max(0, Number(lc.offset)||0)
     movieStartOffsetRef.current = Math.max(0, Number(lm.offset)||0)
@@ -224,24 +245,26 @@ export function usePlayerController(opts: PlayerOpts){
     const clipUrl  = `${backendBase}/video/clip?t=${Number(lc.base).toFixed(3)}&d=${Number(lc.effective).toFixed(3)}&pre=${preC}&post=${postC}`
     const movieUrl = `${backendBase}/video/movie?t=${Number(lm.base).toFixed(3)}&d=${Number(lm.effective).toFixed(3)}&pre=${preM}&post=${postM}`
 
-    // 暂时禁用复用，确保 d 改变后浏览器真正拉取新的片段（避免看到旧的 duration）
-    const finalClipUrl = clipUrl
-    const finalMovieUrl = movieUrl
+    const needSetClip  = (clipUrl  !== lastClipUrlRef.current)
+    const needSetMovie = (movieUrl !== lastMovieUrlRef.current)
 
-    onSetSrc?.(finalClipUrl, finalMovieUrl)
-    lastClipUrlRef.current = finalClipUrl
-    lastMovieUrlRef.current = finalMovieUrl
-    lastClipBaseRef.current = Number(lc.base)
-    lastClipEffRef.current  = Number(lc.effective)
-    lastMovBaseRef.current  = Number(lm.base)
-    lastMovEffRef.current   = Number(lm.effective)
+    // 只有在 URL 变化时才更新 src，避免重复解码引起的抖动
+    if (needSetClip || needSetMovie){
+      onSetSrc?.(needSetClip ? clipUrl : (lastClipUrlRef.current || clipUrl),
+                 needSetMovie ? movieUrl : (lastMovieUrlRef.current || movieUrl))
+      lastClipUrlRef.current  = clipUrl
+      lastMovieUrlRef.current = movieUrl
+      lastClipBaseRef.current = Number(lc.base)
+      lastClipEffRef.current  = Number(lc.effective)
+      lastMovBaseRef.current  = Number(lm.base)
+      lastMovEffRef.current   = Number(lm.effective)
+      // 冷却：仅在真正换源时启用
+      suppressUntilRef.current = Date.now() + 1200
+    }
 
     // 设定逻辑播放范围，供结束判断与进度条使用
     rangeRef.current = { clipStart, clipEnd, movieStart, movieEnd }
     setLoopCount(0)
-
-    // 强制暂停，避免边换源边播放引发的自动回到 0 的行为
-    pause()
 
     // 初始 seek 到各自 offset（相对当前流从 0 开始）
     const clipOffset  = Math.max(0, clipStartOffsetRef.current)
@@ -249,17 +272,53 @@ export function usePlayerController(opts: PlayerOpts){
     ensureSeek(clipRef.current,  clipOffset)
     ensureSeek(movieRef.current, movieOffset)
 
-    // 冷却 1.2s，忽略初始化阶段的 0-seek 噪声
-    suppressUntilRef.current = Date.now() + 1200
-
-    // 等待两端至少一次 seek 落到位（或超时兜底）后再播放
+    // 等待就位（只要 latest）
+    if (myId !== actionIdRef.current) return
     try {
       if (clipRef.current)  await waitSeeked(clipRef.current,  clipOffset)
       if (movieRef.current) await waitSeeked(movieRef.current, movieOffset)
     } catch {}
 
+    if (myId !== actionIdRef.current) return
     await play()
   }, [backendBase, clipRef, movieRef, onSetSrc, play, pause])
+
+  useEffect(()=>{
+    const cv = clipRef.current
+    const mv = movieRef.current
+    if (!cv || !mv) return
+
+    const handleEnded = () => {
+      const r = rangeRef.current
+      if (!r) return
+      const cOff = clipStartOffsetRef.current
+      const mOff = movieStartOffsetRef.current
+      const clipLen = Math.max(0.01, r.clipEnd - r.clipStart)
+      const movLen  = Math.max(0.01, r.movieEnd - r.movieStart)
+
+      const next = loopCount + 1
+      const allowLoop = Math.max(1, maxLoops) > 1
+
+      if (allowLoop && next <= Math.max(1, maxLoops)){
+        try { cv.currentTime = cOff } catch {}
+        try { mv.currentTime = mOff } catch {}
+        try { cv.play() } catch {}
+        try { mv.play() } catch {}
+        setLoopCount(next)
+      } else {
+        try { cv.currentTime = Math.min(cv.currentTime, cOff + clipLen) } catch {}
+        try { mv.currentTime = Math.min(mv.currentTime, mOff + movLen) } catch {}
+        pause()
+      }
+    }
+
+    cv.addEventListener('ended', handleEnded)
+    mv.addEventListener('ended', handleEnded)
+    return ()=>{
+      cv.removeEventListener('ended', handleEnded)
+      mv.removeEventListener('ended', handleEnded)
+    }
+  }, [clipRef, movieRef, maxLoops, loopCount, pause])
 
   // RAF 轮询：仅在播放时检查是否到段尾，按 offset 回绕，并做节流
   useEffect(()=>{
