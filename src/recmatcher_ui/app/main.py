@@ -630,6 +630,205 @@ def candidates(seg_id: int = Query(...), mode: str = Query("top"), k: int = Quer
     sl = items[offset: offset + k]
     return {"ok": True, "seg_id": seg_id, "mode": mode, "total": total, "items": sl}
 
+# --- orig_segs 索引与“场景内/走廊”辅助 --------------------------------------
+
+def _orig_segs_path() -> Path:
+    return Path(STATE.project_root or ".") / "orig_segs_2s.json"
+
+
+def _ensure_orig_index():
+    """把 orig_segs_2s.json 建一个 {scene_id: [segs...]} 的内存索引。"""
+    if hasattr(STATE, "_orig_index") and isinstance(STATE._orig_index, dict) and STATE._orig_index:
+        return
+    p = _orig_segs_path()
+    idx: dict[int, list] = {}
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                arr = json.load(f)
+            if isinstance(arr, list):
+                for seg in arr:
+                    sid = seg.get("scene_id")
+                    if sid is None:
+                        continue
+                    try:
+                        sid = int(sid)
+                    except Exception:
+                        continue
+                    idx.setdefault(sid, []).append(seg)
+        except Exception:
+            idx = {}
+    else:
+        idx = {}
+    STATE._orig_index = idx
+
+
+def _orig_list(scene_id: int) -> list[dict]:
+    _ensure_orig_index()
+    return list((STATE._orig_index or {}).get(int(scene_id), []))
+
+
+def _unique_clip_scene_order() -> list[int]:
+    """按 STATE.match_segments 的出现顺序，得到 clip scene 的去重列表。"""
+    order = []
+    seen = set()
+    for r in STATE.match_segments:
+        cid = r.get("scene_id")
+        if cid is None:
+            continue
+        try:
+            cid = int(cid)
+        except Exception:
+            continue
+        if cid not in seen:
+            seen.add(cid)
+            order.append(cid)
+    return order
+
+
+def _anchor_scene_for_row(row: dict) -> int | None:
+    """优先 applied -> matched -> top0，取其 scene_id 作为锚点原片 scene。"""
+    seg_id = row.get("seg_id")
+    if isinstance(seg_id, int) and (STATE.applied_changes or {}).get(seg_id):
+        mo = STATE.applied_changes[seg_id] or {}
+        return mo.get("scene_id")
+    mo = row.get("matched_orig_seg") or {}
+    if mo.get("scene_id") is not None:
+        return mo.get("scene_id")
+    tops = row.get("top_matches") or []
+    if tops:
+        try:
+            return tops[0].get("scene_id")
+        except Exception:
+            return None
+    return None
+
+
+def _anchor_scene_for_clip_scene(clip_scene_id: int) -> int | None:
+    """找该 clip 场景第一条记录，取其锚点原片 scene。"""
+    for r in STATE.match_segments:
+        try:
+            if int(r.get("scene_id")) == int(clip_scene_id):
+                return _anchor_scene_for_row(r)
+        except Exception:
+            continue
+    return None
+
+
+def _row_by_seg_id(seg_id: int) -> dict | None:
+    for r in STATE.match_segments:
+        try:
+            if int(r.get("seg_id")) == int(seg_id):
+                return r
+        except Exception:
+            continue
+    return None
+
+
+def _map_orig_to_candidate(seg: dict, source: str) -> dict:
+    """把 orig_segs 的一条记录映射成 Candidate 形状，统一前端处理。"""
+    d = {
+        "seg_id": seg.get("seg_id"),
+        "scene_seg_idx": seg.get("scene_seg_idx"),
+        "start": seg.get("start") or 0.0,
+        "end": seg.get("end") or ((seg.get("start") or 0.0) + 2.0),
+        "scene_id": seg.get("scene_id"),
+        "score": seg.get("score"),  # 可能没有
+        "faiss_id": seg.get("faiss_id"),
+        "movie_id": "movie",
+        "shot_id": -1,
+        "source": source,
+    }
+    return d
+
+
+@app.get("/candidates/scene_neighborhood")
+def candidates_scene_neighborhood(seg_id: int = Query(...), span: int = Query(2)):
+    """
+    基于当前选中 seg 的“锚点原片场景”，返回该场景 ±span 的所有原片段（扁平列表）。
+    返回 items（Candidate 形状），并带上 meta（anchor_scene_id、scene_ids）。
+    """
+    row = _row_by_seg_id(seg_id)
+    if not row:
+        raise HTTPException(404, "seg not found")
+
+    anchor = _anchor_scene_for_row(row)
+    if anchor is None:
+        return {"ok": True, "seg_id": seg_id, "anchor_scene_id": None, "scene_ids": [], "items": []}
+
+    scene_ids = list(range(max(0, anchor - span), anchor + span + 1))
+    items = []
+    for sid in scene_ids:
+        for seg in _orig_list(sid):
+            mapped = _map_orig_to_candidate(seg, source="scene_neigh")
+            # 附带 UI 辅助字段（可选）
+            mapped["_sceneId"] = sid
+            mapped["_isCurrentScene"] = (sid == anchor)
+            items.append(mapped)
+    return {"ok": True, "seg_id": seg_id, "anchor_scene_id": anchor, "scene_ids": scene_ids, "items": items}
+
+
+@app.get("/candidates/corridor")
+def candidates_corridor(seg_id: int = Query(...), span: int = Query(2)):
+    """
+    基于“前一个 clip 场景”和“后一个 clip 场景”的锚点原片场景，
+    分别取它们的相邻场景（prev: anchor+1..+span，next: anchor-span..anchor-1）。
+    返回 prev / next 两个列表（Candidate 形状）。
+    """
+    row = _row_by_seg_id(seg_id)
+    if not row:
+        raise HTTPException(404, "seg not found")
+
+    # 找当前 row 所属的 clip 场景 & 前/后 clip 场景 id
+    try:
+        cur_clip = int(row.get("scene_id"))
+    except Exception:
+        cur_clip = None
+    if cur_clip is None:
+        return {"ok": True, "seg_id": seg_id, "prev": [], "next": [], "anchors": {"prev": None, "next": None}}
+
+    order = _unique_clip_scene_order()
+    try:
+        idx = order.index(cur_clip)
+    except ValueError:
+        idx = -1
+
+    prev_clip = order[idx - 1] if idx > 0 else None
+    next_clip = order[idx + 1] if (idx >= 0 and idx < len(order) - 1) else None
+
+    prev_anchor = _anchor_scene_for_clip_scene(prev_clip) if prev_clip is not None else None
+    next_anchor = _anchor_scene_for_clip_scene(next_clip) if next_clip is not None else None
+
+    prev_items = []
+    next_items = []
+
+    if prev_anchor is not None:
+        # “前序走廊”：从锚点往后的场景（anchor+1..+span）
+        ids = [prev_anchor + i for i in range(1, span + 1)]
+        for sid in ids:
+            for seg in _orig_list(sid):
+                m = _map_orig_to_candidate(seg, source="corridor_prev")
+                m["_sceneId"] = sid
+                prev_items.append(m)
+
+    if next_anchor is not None:
+        # “后续走廊”：从锚点往前的场景（anchor-span..anchor-1）
+        ids = [next_anchor - i for i in range(span, 0, -1) if next_anchor - i >= 0]
+        for sid in ids:
+            for seg in _orig_list(sid):
+                m = _map_orig_to_candidate(seg, source="corridor_next")
+                m["_sceneId"] = sid
+                next_items.append(m)
+
+    return {
+        "ok": True,
+        "seg_id": seg_id,
+        "anchors": {"prev": prev_anchor, "next": next_anchor},
+        "span": span,
+        "prev": prev_items,
+        "next": next_items,
+    }
+
 @app.get("/scenes")
 def scenes():
     return {"ok": True, "scenes": _scenes_summary()}
@@ -715,3 +914,138 @@ def save(req: SaveReq):
     with open(out_path,"w",encoding="utf-8") as f:
         json.dump(arr, f, ensure_ascii=False, indent=2)
     return {"ok": True, "path": out_path}
+
+@app.get("/candidates/summary")
+def candidates_summary(
+    seg_id: int = Query(...),
+    span: int = Query(2),
+    k: int = Query(120),
+    offset: int = Query(0),
+):
+    """
+    一次性返回该 seg 相关的：top / scene 过滤 / all / 场景内邻域 / 走廊
+    结构统一为 Candidate；前端一次请求即可驱动 4 个 Tab。
+    说明：
+      - top/scene/all 会做去重（与 /candidates 相同）并应用 k/offset 分页；
+      - neighborhood（场景内邻域）和 corridor（走廊）返回完整列表（不分页）。
+    """
+    row = _row_by_seg_id(seg_id)
+    if not row:
+        raise HTTPException(404, "seg not found")
+
+    # --- 组装 top/scene/all（沿用 /candidates 的逻辑） -------------------------
+    applied = (STATE.applied_changes or {}).get(seg_id)
+    matched = row.get("matched_orig_seg")
+    top_raw = list(row.get("top_matches", [])) or []
+    explain_extra = _get_explain_candidates(seg_id)
+
+    def _tag(it: dict, src: str) -> dict:
+        if not isinstance(it, dict):
+            return it
+        it = dict(it)
+        it.setdefault("source", src)
+        return it
+
+    # top
+    items_top = _dedup_candidates([_tag(x, "top") for x in top_raw] +
+                                  [_tag(x, "explain") for x in explain_extra])
+    total_top = len(items_top)
+    items_top_page = items_top[offset: offset + k]
+
+    # scene（仅筛到同一 movie scene）
+    target_scene = None
+    if isinstance(applied, dict) and applied.get("scene_id") is not None:
+        target_scene = applied.get("scene_id")
+    elif isinstance(matched, dict) and matched.get("scene_id") is not None:
+        target_scene = matched.get("scene_id")
+    items_scene = []
+    if target_scene is not None:
+        items_scene = _dedup_candidates(
+            [_tag(x, "top") for x in top_raw if int(x.get("scene_id") or -1) == int(target_scene)] +
+            [_tag(x, "explain") for x in explain_extra if int(x.get("scene_id") or -1) == int(target_scene)]
+        )
+    total_scene = len(items_scene)
+    items_scene_page = items_scene[offset: offset + k]
+
+    # all（applied/matched + top + explain）
+    items_all = []
+    if isinstance(applied, dict):
+        items_all.append(_tag(applied, "applied"))
+    elif isinstance(matched, dict):
+        items_all.append(_tag(matched, "matched"))
+    items_all.extend(_tag(x, "top") for x in top_raw)
+    items_all.extend(_tag(x, "explain") for x in explain_extra)
+    items_all = _dedup_candidates(items_all)
+    total_all = len(items_all)
+    items_all_page = items_all[offset: offset + k]
+
+    # --- 场景内邻域（沿用 /candidates/scene_neighborhood 逻辑） ---------------
+    anchor = _anchor_scene_for_row(row)
+    if anchor is None:
+        scene_ids = []
+        neigh_items = []
+    else:
+        scene_ids = list(range(max(0, anchor - span), anchor + span + 1))
+        neigh_items = []
+        for sid in scene_ids:
+            for seg in _orig_list(sid):
+                m = _map_orig_to_candidate(seg, source="scene_neigh")
+                m["_sceneId"] = sid
+                m["_isCurrentScene"] = (sid == anchor)
+                neigh_items.append(m)
+
+    # --- 走廊（沿用 /candidates/corridor 逻辑） -------------------------------
+    # 当前 row 所属 clip scene & 前/后 clip 场景
+    try:
+        cur_clip = int(row.get("scene_id"))
+    except Exception:
+        cur_clip = None
+
+    prev_anchor = None
+    next_anchor = None
+    corr_prev = []
+    corr_next = []
+    if cur_clip is not None:
+        order = _unique_clip_scene_order()
+        try:
+            idx = order.index(cur_clip)
+        except ValueError:
+            idx = -1
+        prev_clip = order[idx - 1] if idx > 0 else None
+        next_clip = order[idx + 1] if (idx >= 0 and idx < len(order) - 1) else None
+        prev_anchor = _anchor_scene_for_clip_scene(prev_clip) if prev_clip is not None else None
+        next_anchor = _anchor_scene_for_clip_scene(next_clip) if next_clip is not None else None
+
+        if prev_anchor is not None:
+            for sid in [prev_anchor + i for i in range(1, span + 1)]:
+                for seg in _orig_list(sid):
+                    m = _map_orig_to_candidate(seg, source="corridor_prev")
+                    m["_sceneId"] = sid
+                    corr_prev.append(m)
+        if next_anchor is not None:
+            for sid in [next_anchor - i for i in range(span, 0, -1) if next_anchor - i >= 0]:
+                for seg in _orig_list(sid):
+                    m = _map_orig_to_candidate(seg, source="corridor_next")
+                    m["_sceneId"] = sid
+                    corr_next.append(m)
+
+    return {
+        "ok": True,
+        "seg_id": seg_id,
+
+        # 场景内邻域 meta
+        "anchor_scene_id": anchor,
+        "scene_ids": scene_ids,
+
+        # 走廊 meta
+        "anchors": {"prev": prev_anchor, "next": next_anchor},
+
+        # 三个候选桶（分页）
+        "top":   {"total": total_top,   "items": items_top_page},
+        "scene": {"total": total_scene, "items": items_scene_page},
+        "all":   {"total": total_all,   "items": items_all_page},
+
+        # 邻域 / 走廊（不分页，完整）
+        "neighborhood": {"span": span, "items": neigh_items},
+        "corridor": {"span": span, "prev": corr_prev, "next": corr_next},
+    }
