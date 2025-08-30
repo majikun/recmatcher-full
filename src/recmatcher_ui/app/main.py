@@ -798,35 +798,50 @@ def candidates_corridor(seg_id: int = Query(...), span: int = Query(2)):
 
     prev_anchor = _anchor_scene_for_clip_scene(prev_clip) if prev_clip is not None else None
     next_anchor = _anchor_scene_for_clip_scene(next_clip) if next_clip is not None else None
+    
+    # 获取当前场景的锚点
+    current_anchor = _anchor_scene_for_clip_scene(cur_clip)
 
     prev_items = []
     next_items = []
+    current_items = []
 
     if prev_anchor is not None:
         # “前序走廊”：从锚点往后的场景（anchor+1..+span）
-        ids = [prev_anchor + i for i in range(1, span + 1)]
+        ids = [prev_anchor + i for i in range(0, span + 1)]
         for sid in ids:
             for seg in _orig_list(sid):
                 m = _map_orig_to_candidate(seg, source="corridor_prev")
                 m["_sceneId"] = sid
+                m["_isAnchorScene"] = (sid == prev_anchor)
                 prev_items.append(m)
 
     if next_anchor is not None:
         # “后续走廊”：从锚点往前的场景（anchor-span..anchor-1）
-        ids = [next_anchor - i for i in range(span, 0, -1) if next_anchor - i >= 0]
+        ids = [next_anchor - i for i in range(span, -1, -1) if next_anchor - i >= 0]
         for sid in ids:
             for seg in _orig_list(sid):
                 m = _map_orig_to_candidate(seg, source="corridor_next")
                 m["_sceneId"] = sid
+                m["_isAnchorScene"] = (sid == next_anchor)
                 next_items.append(m)
+
+    # 当前场景的候选（放在中间）
+    if current_anchor is not None:
+        for seg in _orig_list(current_anchor):
+            m = _map_orig_to_candidate(seg, source="corridor_current")
+            m["_sceneId"] = current_anchor
+            m["_isAnchorScene"] = True
+            current_items.append(m)
 
     return {
         "ok": True,
         "seg_id": seg_id,
-        "anchors": {"prev": prev_anchor, "next": next_anchor},
+        "anchors": {"prev": prev_anchor, "next": next_anchor, "current": current_anchor},
         "span": span,
         "prev": prev_items,
         "next": next_items,
+        "current": current_items,
     }
 
 @app.get("/scenes")
@@ -1005,6 +1020,7 @@ def candidates_summary(
     next_anchor = None
     corr_prev = []
     corr_next = []
+    corr_current = []
     if cur_clip is not None:
         order = _unique_clip_scene_order()
         try:
@@ -1015,19 +1031,32 @@ def candidates_summary(
         next_clip = order[idx + 1] if (idx >= 0 and idx < len(order) - 1) else None
         prev_anchor = _anchor_scene_for_clip_scene(prev_clip) if prev_clip is not None else None
         next_anchor = _anchor_scene_for_clip_scene(next_clip) if next_clip is not None else None
+        
+        # 获取当前场景的锚点
+        current_anchor = _anchor_scene_for_clip_scene(cur_clip)
 
         if prev_anchor is not None:
-            for sid in [prev_anchor + i for i in range(1, span + 1)]:
+            for sid in [prev_anchor + i for i in range(0, span + 1)]:
                 for seg in _orig_list(sid):
                     m = _map_orig_to_candidate(seg, source="corridor_prev")
                     m["_sceneId"] = sid
+                    m["_isAnchorScene"] = (sid == prev_anchor)
                     corr_prev.append(m)
         if next_anchor is not None:
-            for sid in [next_anchor - i for i in range(span, 0, -1) if next_anchor - i >= 0]:
+            for sid in [next_anchor - i for i in range(span, -1, -1) if next_anchor - i >= 0]:
                 for seg in _orig_list(sid):
                     m = _map_orig_to_candidate(seg, source="corridor_next")
                     m["_sceneId"] = sid
+                    m["_isAnchorScene"] = (sid == next_anchor)
                     corr_next.append(m)
+
+        # 当前场景的候选（放在中间）
+        if current_anchor is not None:
+            for seg in _orig_list(current_anchor):
+                m = _map_orig_to_candidate(seg, source="corridor_current")
+                m["_sceneId"] = current_anchor
+                m["_isAnchorScene"] = True
+                corr_current.append(m)
 
     return {
         "ok": True,
@@ -1038,7 +1067,7 @@ def candidates_summary(
         "scene_ids": scene_ids,
 
         # 走廊 meta
-        "anchors": {"prev": prev_anchor, "next": next_anchor},
+        "anchors": {"prev": prev_anchor, "next": next_anchor, "current": current_anchor},
 
         # 三个候选桶（分页）
         "top":   {"total": total_top,   "items": items_top_page},
@@ -1047,5 +1076,5 @@ def candidates_summary(
 
         # 邻域 / 走廊（不分页，完整）
         "neighborhood": {"span": span, "items": neigh_items},
-        "corridor": {"span": span, "prev": corr_prev, "next": corr_next},
+        "corridor": {"span": span, "prev": corr_prev, "next": corr_next, "current": corr_current},
     }
