@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import shutil
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -9,7 +10,7 @@ from .state import STATE
 from .schemas import OpenProjectReq, ApplyBatchReq, SaveReq
 from .utils import group_by_clip_scene
 from pathlib import Path
-import json
+import json, shutil
 from typing import List, Tuple
 from pydantic import BaseModel
 
@@ -1091,17 +1092,70 @@ def clear_overrides():
             pass
     return {"ok": True}
 
-@app.post("/save")
-def save(req: SaveReq):
+
+# --- export merged match_segments.json (with overrides) -----------------------
+
+def _merged_segments_with_overrides() -> list:
+    """Return match_segments with overrides merged in (matched_orig_seg replaced)."""
     arr = []
     for r in STATE.match_segments:
         cp = dict(r)
         seg_id = r.get("seg_id")
-        if seg_id in STATE.applied_changes:
+        if seg_id in (STATE.applied_changes or {}):
             cp["matched_orig_seg"] = STATE.applied_changes[seg_id]
         arr.append(cp)
+    return arr
+
+@app.post("/export")
+def export_match_segments():
+    """
+    Merge STATE.match_segments with STATE.applied_changes (match_overrides.json),
+    back up existing match_segments.json (if any), and atomically write the new
+    merged file to <project_root>/match_segments.json.
+    """
+    root = Path(STATE.project_root or ".")
+    out_path = root / "match_segments.json"
+
+    # Prepare merged array
+    arr = _merged_segments_with_overrides()
+
+    # Backup existing file, if present
+    backup_path = None
+    if out_path.exists():
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_path = out_path.with_name(out_path.name + f".bak-{ts}")
+        try:
+            shutil.copy2(out_path, backup_path)
+        except Exception as e:
+            print(f"[export] backup copy failed: {e}")
+            # Continue; still write the new file
+
+    # Atomic write
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(arr, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, out_path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "path": str(out_path),
+        "backup": (str(backup_path) if backup_path else None),
+        "count": len(arr),
+    }
+
+
+@app.post("/save")
+def save(req: SaveReq):
+    arr = _merged_segments_with_overrides()
     out_path = req.out_path or str(Path(STATE.project_root or ".") / "match_segments_exported.json")
-    with open(out_path,"w",encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(arr, f, ensure_ascii=False, indent=2)
     return {"ok": True, "path": out_path}
 
