@@ -279,11 +279,59 @@ def _write_review_state(st: dict) -> Path:
     os.replace(tmp, p)
     return p
 
+
+# === review status helpers ===
+def _effective_match_for_seg(seg_id: int) -> dict | None:
+    """
+    当前 seg 生效的匹配关系：
+    - 若有 override（STATE.applied_changes）则取之
+    - 否则取自动匹配 matched_orig_seg
+    - 若均无，返回 None
+    """
+    try:
+        if isinstance(STATE.applied_changes, dict) and seg_id in (STATE.applied_changes or {}):
+            mo = STATE.applied_changes.get(seg_id)
+            if isinstance(mo, dict):
+                return mo
+    except Exception:
+        pass
+    row = _find_seg_row(seg_id)
+    if isinstance(row, dict):
+        mo = row.get("matched_orig_seg")
+        if isinstance(mo, dict):
+            return mo
+    return None
+
+def _fp_from_match(mo: dict | None) -> str | None:
+    """
+    由匹配关系计算稳定指纹：scene_id:scene_seg_idx:start_ms:end_ms（保留 3 位小数）
+    用于判断评价是否“需重评”（当匹配关系发生变化时）。
+    """
+    if not isinstance(mo, dict):
+        return None
+    def _f(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+    sid = mo.get("scene_id")
+    idx = mo.get("scene_seg_idx")
+    start = _f(mo.get("start"))
+    end = _f(mo.get("end") if mo.get("end") is not None else start)
+    if sid is None or idx is None:
+        return None
+    try:
+        sid = int(sid); idx = int(idx)
+    except Exception:
+        return None
+    return f"{sid}:{idx}:{start:.3f}:{end:.3f}"
+
+def _current_fp_for_seg(seg_id: int) -> str | None:
+    return _fp_from_match(_effective_match_for_seg(seg_id))
+
 class ReviewUpdateReq(BaseModel):
     seg_id: int
-    state: str  # "anchor" | "matched" | "deferred" | "rejected"
-    chosen: dict | None = None   # only used when state in {"anchor","matched"}
-    has_offset: bool | None = None  # simplified: boolean flag only (no note)
+    status: str  # "ok" | "needTrim" | "unsure" | "mismatch"
 # --- orig_segs 索引与“场景内/走廊”辅助 --------------------------------------
 
 @app.get("/review/state")
@@ -297,51 +345,28 @@ def get_review_state():
 @app.post("/review/update")
 def post_review_update(req: ReviewUpdateReq):
     """
-    Update review state for a segment.
-    - Persist to review_state.json
-    - If state is 'anchor' or 'matched' and 'chosen' provided, also update overrides (match_overrides.json)
+    更新某个 seg 的“校对评价”（与 override 无关）。
+    - status ∈ {"ok","needTrim","unsure","mismatch"}
+    - 自动记录当前“生效匹配关系”的指纹 fp，用于后续判断是否需重评
     """
-    valid_states = {"anchor", "matched", "deferred", "rejected"}
-    state = (req.state or "").lower()
-    if state not in valid_states:
-        raise HTTPException(400, f"state must be one of {sorted(valid_states)}")
+    valid = {"ok", "needTrim", "unsure", "mismatch"}
+    status = (req.status or "").strip()
+    if status not in valid:
+        raise HTTPException(400, f"status must be one of {sorted(valid)}")
 
-    # load, patch, save review_state
     st = _read_review_state()
     segs = st.get("segs") if isinstance(st.get("segs"), dict) else {}
-    entry = segs.get(str(req.seg_id)) if isinstance(segs.get(str(req.seg_id)), dict) else {}
 
-    entry["state"] = state
-    if req.has_offset is not None:
-        entry["has_offset"] = bool(req.has_offset)
-    # only keep 'chosen' for matched/anchor (and only if provided)
-    if state in {"anchor", "matched"} and req.chosen is not None:
-        entry["chosen"] = req.chosen
-    elif state not in {"anchor", "matched"}:
-        # for deferred/rejected we do not store a chosen in review_state
-        entry.pop("chosen", None)
+    fp_now = _current_fp_for_seg(req.seg_id)
+    entry = {"status": status}
+    if fp_now is not None:
+        entry["fp"] = fp_now
 
     segs[str(req.seg_id)] = entry
     st["segs"] = segs
     review_path = _write_review_state(st)
 
-    # synchronize overrides if needed
-    overrides_info = None
-    if state in {"anchor", "matched"} and req.chosen is not None:
-        # update in-memory overrides and persist
-        if not isinstance(STATE.applied_changes, dict):
-            STATE.applied_changes = {}
-        STATE.applied_changes[int(req.seg_id)] = req.chosen
-        sidecar = _save_overrides_from_state()
-        overrides_info = {"path": str(sidecar), "count": len(STATE.applied_changes or {})}
-
-    return {
-        "ok": True,
-        "seg_id": req.seg_id,
-        "state": state,
-        "review_path": str(review_path),
-        "overrides": overrides_info,
-    }
+    return {"ok": True, "seg_id": req.seg_id, "entry": entry, "review_path": str(review_path)}
 
 
 def _scenes_summary():
@@ -957,6 +982,9 @@ def scenes():
 @app.get("/segments")
 def segments(clip_scene_id: int = Query(...)):
     groups = group_by_clip_scene(STATE.match_segments)
+    # 加载当前的评价映射
+    _rev = _read_review_state()
+    _rev_map = _rev.get("segs", {}) if isinstance(_rev.get("segs"), dict) else {}
     segs = groups.get(clip_scene_id, [])
     out=[]
     for r in segs:
@@ -977,6 +1005,12 @@ def segments(clip_scene_id: int = Query(...)):
             "matched_source": matched_source,
             "is_override": is_override,
             "top_matches": r.get("top_matches", []),
+            # === review ===
+            "review_status": (_rev_map.get(str(seg_id)) or {}).get("status"),
+            "review_stale": (
+                (((_rev_map.get(str(seg_id)) or {}).get("fp") or "") != (_current_fp_for_seg(seg_id) or ""))
+                if ((_rev_map.get(str(seg_id)) or {}).get("status") is not None) else False
+            ),
         })
     return out
 
