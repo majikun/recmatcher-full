@@ -417,9 +417,30 @@ def healthz(): return {"ok": True}
 def open_project(req: OpenProjectReq):
     if not Path(req.root).exists():
         raise HTTPException(404, "root not found")
-    STATE.load_project(req.root, req.movie_path, req.clip_path)
+    
+    # Read smart_reclip_project.json to get video paths
+    project_file = Path(req.root) / "smart_reclip_project.json"
+    movie_path = req.movie_path  # fallback to request if file not found
+    clip_path = req.clip_path    # fallback to request if file not found
+    
+    if project_file.exists():
+        try:
+            with open(project_file, "r", encoding="utf-8") as f:
+                project_data = json.load(f)
+            
+            video_files = project_data.get("video_files", {})
+            movie_path = video_files.get("orig_cropped", movie_path)
+            input_files = project_data.get("input_files", {})
+            clip_path = input_files.get("clip_path", clip_path)
+        except Exception as e:
+            # Log the error but continue with fallback paths
+            print(f"Warning: Failed to read smart_reclip_project.json: {str(e)}")
+    
+    # Load project with resolved paths
+    STATE.load_project(req.root, movie_path, clip_path)
     STATE.build_explain_offsets()
     _load_overrides_into_state()
+    
     # Precompute and persist keyframes (movie & clip) for faster, accurate seeks
     try:
         if STATE.paths.get("movie"):
@@ -428,8 +449,11 @@ def open_project(req: OpenProjectReq):
             _ensure_keyframes("clip")
     except Exception:
         pass
+    
     scenes = _scenes_summary()
-    return {"ok": True, "scenes": scenes, "paths": STATE.paths}
+    print(STATE.paths)
+    return {"ok": True, "scenes": scenes, "paths": STATE.paths, 
+            "movie": STATE.paths.get("movie"), "clip": STATE.paths.get("clip")}
 
 
 # Expose keyframes for debugging or front-end
@@ -616,6 +640,12 @@ def _read_explain_slow(seg_id: int):
         pr = Path(STATE.project_root or ".")
         for name in ("match_explain.jsonl", "match_explain.json", "explain.jsonl"):
             paths.append(pr / name)
+        
+        # Check if any path exists, log warning if none found
+        if not any(path.exists() for path in paths):
+            print(f"Warning: match_explain.jsonl not found in any of the expected locations: {[str(p) for p in paths]}. Explain candidates will be unavailable.")
+            return None
+        
         for path in paths:
             try:
                 if not path or not path.exists():
@@ -655,6 +685,11 @@ def _get_explain_candidates(seg_id: int) -> list[dict]:
     if not rec:
         # slow-path scan when offsets are not available
         rec = _read_explain_slow(seg_id)
+    
+    # Ensure we always return a list, even if rec is None
+    if not rec:
+        return []
+    
     items: list[dict] = []
     if isinstance(rec, dict):
         # try common keys (prefer post-processed, then pre-processed)
