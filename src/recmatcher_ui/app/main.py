@@ -11,6 +11,13 @@ from .utils import group_by_clip_scene
 from pathlib import Path
 import json
 from typing import List, Tuple
+from pydantic import BaseModel
+
+from datetime import datetime, timezone
+
+# --- FastAPI app instance (must be defined before decorators) ---------------
+app = FastAPI(title="Recmatcher UI Backend", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- keyframes helpers --------------------------------------------------------
 
@@ -235,8 +242,107 @@ def _save_overrides_from_state() -> Path:
     os.replace(tmp, p)
     return p
 
-app = FastAPI(title="Recmatcher UI Backend", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# --- review_state helpers ----------------------------------------------------
+def _review_state_path() -> Path:
+    """Side file to persist human review state (anchor/matched/deferred/rejected, has_offset flag)."""
+    return Path(STATE.project_root or ".") / "review_state.json"
+
+def _read_review_state() -> dict:
+    p = _review_state_path()
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                # sanity normalization
+                meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+                segs = obj.get("segs") if isinstance(obj.get("segs"), dict) else {}
+                return {"meta": meta, "segs": segs}
+        except Exception:
+            pass
+    # default skeleton
+    return {"meta": {"version": 1, "updated_at": None}, "segs": {}}
+
+def _write_review_state(st: dict) -> Path:
+    p = _review_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    meta = st.get("meta") if isinstance(st.get("meta"), dict) else {}
+    meta["version"] = 1
+    try:
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception:
+        meta["updated_at"] = None
+    st["meta"] = meta
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+    return p
+
+class ReviewUpdateReq(BaseModel):
+    seg_id: int
+    state: str  # "anchor" | "matched" | "deferred" | "rejected"
+    chosen: dict | None = None   # only used when state in {"anchor","matched"}
+    has_offset: bool | None = None  # simplified: boolean flag only (no note)
+# --- orig_segs 索引与“场景内/走廊”辅助 --------------------------------------
+
+@app.get("/review/state")
+def get_review_state():
+    """
+    Return the full review_state.json content (or default skeleton if not present).
+    """
+    st = _read_review_state()
+    return {"ok": True, "path": str(_review_state_path()), "data": st}
+
+@app.post("/review/update")
+def post_review_update(req: ReviewUpdateReq):
+    """
+    Update review state for a segment.
+    - Persist to review_state.json
+    - If state is 'anchor' or 'matched' and 'chosen' provided, also update overrides (match_overrides.json)
+    """
+    valid_states = {"anchor", "matched", "deferred", "rejected"}
+    state = (req.state or "").lower()
+    if state not in valid_states:
+        raise HTTPException(400, f"state must be one of {sorted(valid_states)}")
+
+    # load, patch, save review_state
+    st = _read_review_state()
+    segs = st.get("segs") if isinstance(st.get("segs"), dict) else {}
+    entry = segs.get(str(req.seg_id)) if isinstance(segs.get(str(req.seg_id)), dict) else {}
+
+    entry["state"] = state
+    if req.has_offset is not None:
+        entry["has_offset"] = bool(req.has_offset)
+    # only keep 'chosen' for matched/anchor (and only if provided)
+    if state in {"anchor", "matched"} and req.chosen is not None:
+        entry["chosen"] = req.chosen
+    elif state not in {"anchor", "matched"}:
+        # for deferred/rejected we do not store a chosen in review_state
+        entry.pop("chosen", None)
+
+    segs[str(req.seg_id)] = entry
+    st["segs"] = segs
+    review_path = _write_review_state(st)
+
+    # synchronize overrides if needed
+    overrides_info = None
+    if state in {"anchor", "matched"} and req.chosen is not None:
+        # update in-memory overrides and persist
+        if not isinstance(STATE.applied_changes, dict):
+            STATE.applied_changes = {}
+        STATE.applied_changes[int(req.seg_id)] = req.chosen
+        sidecar = _save_overrides_from_state()
+        overrides_info = {"path": str(sidecar), "count": len(STATE.applied_changes or {})}
+
+    return {
+        "ok": True,
+        "seg_id": req.seg_id,
+        "state": state,
+        "review_path": str(review_path),
+        "overrides": overrides_info,
+    }
+
 
 def _scenes_summary():
     groups = group_by_clip_scene(STATE.match_segments)
