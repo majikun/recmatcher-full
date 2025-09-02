@@ -11,11 +11,12 @@ class InMemoryState:
         self.applied_changes: dict[int, dict] = {}
         self._explain_offsets: list[int] = []
 
-    def load_project(self, root: str, movie: str | None, clip: str | None):
+    def load_project(self, root: str, movie: str | None, clip: str | None, orig_segs: str | None = None):
         from pathlib import Path; import json
         self.project_root = root
         self.paths["movie"] = movie or ""
         self.paths["clip"] = clip or ""
+        self.paths["orig_segs"] = orig_segs or ""
         def _p(*names):
             for n in names:
                 p = Path(root) / n

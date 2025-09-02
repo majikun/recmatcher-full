@@ -433,12 +433,15 @@ def open_project(req: OpenProjectReq):
             movie_path = video_files.get("orig_cropped", movie_path)
             input_files = project_data.get("input_files", {})
             clip_path = input_files.get("clip_path", clip_path)
+            movie_path = input_files.get("movie_path", movie_path)  # fallback to movie_path if clip_path not present
+            data_files = project_data.get("data_files", {})
+            orig_segs_path = data_files.get("orig_segs", None)
         except Exception as e:
             # Log the error but continue with fallback paths
             print(f"Warning: Failed to read smart_reclip_project.json: {str(e)}")
     
     # Load project with resolved paths
-    STATE.load_project(req.root, movie_path, clip_path)
+    STATE.load_project(req.root, movie_path, clip_path, orig_segs_path)
     STATE.build_explain_offsets()
     _load_overrides_into_state()
     
@@ -800,8 +803,7 @@ def candidates(seg_id: int = Query(...), mode: str = Query("top"), k: int = Quer
 # --- orig_segs 索引与“场景内/走廊”辅助 --------------------------------------
 
 def _orig_segs_path() -> Path:
-    return Path(STATE.project_root or ".") / "orig_segs_2s.json"
-
+    return Path(STATE.paths["orig_segs"]) 
 
 def _ensure_orig_index():
     """把 orig_segs_2s.json 建一个 {scene_id: [segs...]} 的内存索引。"""
