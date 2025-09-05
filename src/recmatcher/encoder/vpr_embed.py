@@ -177,52 +177,52 @@ class VPRemb:
         x = _resize_to_square(x, TARGET_S, SQUARE_MODE)
         return x
 
-def encode_batch(self, clips: List[np.ndarray]) -> np.ndarray:
-    """将一组 clip 编码为 [N,D]；固定方形+批量+JIT，任何异常直接抛出。"""
-    if not clips:
-        return np.zeros((0, self.embed_dim), dtype=np.float32)
-    if self._encode_fn is None or self._params is None:
-        raise RuntimeError("VPR GPU 后端未正确初始化")
+    def encode_batch(self, clips: List[np.ndarray]) -> np.ndarray:
+        """将一组 clip 编码为 [N,D]；固定方形+批量+JIT，任何异常直接抛出。"""
+        if not clips:
+            return np.zeros((0, self.embed_dim), dtype=np.float32)
+        if self._encode_fn is None or self._params is None:
+            raise RuntimeError("VPR GPU 后端未正确初始化")
 
-    import jax, time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    logger = logging.getLogger(__name__)
+        import jax, time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        logger = logging.getLogger(__name__)
 
-    all_vecs = []
-    # 分批处理，避免一次性占用太多内存
-    for start in range(0, len(clips), BATCH_SIZE):
-        chunk = clips[start:start + BATCH_SIZE]
+        all_vecs = []
+        # 分批处理，避免一次性占用太多内存
+        for start in range(0, len(clips), BATCH_SIZE):
+            chunk = clips[start:start + BATCH_SIZE]
 
-        # 1) CPU 预处理（并行）
-        t0 = time.time()
-        if PREPROC_WORKERS <= 1:
-            prepped = [self._prep_clip(c) for c in chunk]
-        else:
-            with ThreadPoolExecutor(max_workers=PREPROC_WORKERS) as ex:
-                prepped = list(ex.map(self._prep_clip, chunk))
-        prep_ms = (time.time() - t0) * 1000.0
+            # 1) CPU 预处理（并行）
+            t0 = time.time()
+            if PREPROC_WORKERS <= 1:
+                prepped = [self._prep_clip(c) for c in chunk]
+            else:
+                with ThreadPoolExecutor(max_workers=PREPROC_WORKERS) as ex:
+                    prepped = list(ex.map(self._prep_clip, chunk))
+            prep_ms = (time.time() - t0) * 1000.0
 
-        bx = np.stack(prepped, axis=0)  # [B,T,S,S,3]
+            bx = np.stack(prepped, axis=0)  # [B,T,S,S,3]
 
-        # 2) GPU 编码
-        t1 = time.time()
-        try:
-            vecs = np.array(self._encode_fn(self._params, bx))  # [B,D]
-        except Exception:
-            logger.error(
-                "VPR GPU 编码失败：batch_size=%d, shape=%s, devices=%s",
-                len(chunk), bx.shape, jax.devices()
-            )
-            raise
-        gpu_ms = (time.time() - t1) * 1000.0
+            # 2) GPU 编码
+            t1 = time.time()
+            try:
+                vecs = np.array(self._encode_fn(self._params, bx))  # [B,D]
+            except Exception:
+                logger.error(
+                    "VPR GPU 编码失败：batch_size=%d, shape=%s, devices=%s",
+                    len(chunk), bx.shape, jax.devices()
+                )
+                raise
+            gpu_ms = (time.time() - t1) * 1000.0
 
-        if vecs.ndim != 2:
-            raise ValueError(f"VPR 输出维度异常：{vecs.shape}（期望 [B,D]）")
-        all_vecs.append(vecs.astype(np.float32))
+            if vecs.ndim != 2:
+                raise ValueError(f"VPR 输出维度异常：{vecs.shape}（期望 [B,D]）")
+            all_vecs.append(vecs.astype(np.float32))
 
-        # 每隔若干批打印一次：哪边在吃时间一眼就看出来
-        if (start // BATCH_SIZE) % 20 == 0:
-            logger.info("VPR batch%4d: prep=%.1f ms  gpu=%.1f ms  (B=%d, T=%d, S=%d)",
-                        start // BATCH_SIZE, prep_ms, gpu_ms, len(chunk), TARGET_T, TARGET_S)
+            # 每隔若干批打印一次：哪边在吃时间一眼就看出来
+            if (start // BATCH_SIZE) % 20 == 0:
+                logger.info("VPR batch%4d: prep=%.1f ms  gpu=%.1f ms  (B=%d, T=%d, S=%d)",
+                            start // BATCH_SIZE, prep_ms, gpu_ms, len(chunk), TARGET_T, TARGET_S)
 
-    return np.concatenate(all_vecs, axis=0)
+        return np.concatenate(all_vecs, axis=0)
