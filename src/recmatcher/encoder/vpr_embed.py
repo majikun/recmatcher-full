@@ -2,7 +2,6 @@ from typing import List
 import numpy as np
 import logging
 import os
-import math
 import cv2  # 用于 resize/颜色变换（Jetson 上已可用）
 
 # ---------------- 在导入 JAX 之前，设置 XLA/JAX 环境（兼容 jaxlib==0.5.0） ----------------
@@ -20,7 +19,7 @@ _set_xla_flags([
 ])
 
 # 其他建议设置（可减少显存占用和噪声）
-os.environ.setdefault("JAX_PLATFORMS", "cuda")                  # 不探测 rocm/tpu
+os.environ.setdefault("JAX_PLATFORMS", "cuda")                  # 只用 CUDA，避免 rocm/tpu 噪声
 os.environ.setdefault("JAX_ENABLE_X64", "0")                    # 省显存/更快
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.70") # 预分配 70% 显存
 # ------------------------------------------------------------------------------------
@@ -60,11 +59,9 @@ def _sample_to_T(x: np.ndarray, T: int) -> np.ndarray:
     if t == 0:
         return np.zeros((T, h, w, c), dtype=x.dtype)
     if t > T:
-        # 均匀选 T 帧
-        idx = np.linspace(0, t - 1, T).round().astype(int)
+        idx = np.linspace(0, t - 1, T).round().astype(int)  # 均匀取样
         return x[idx]
-    # t < T：末帧重复补齐
-    pad = np.repeat(x[[-1]], T - t, axis=0)
+    pad = np.repeat(x[[-1]], T - t, axis=0)  # 末帧补齐
     return np.concatenate([x, pad], axis=0)
 
 def _resize_hw(x: np.ndarray, H: int, W: int) -> np.ndarray:
@@ -77,57 +74,46 @@ def _resize_hw(x: np.ndarray, H: int, W: int) -> np.ndarray:
     return out
 
 class VPRemb:
-    """VideoPrism wrapper with GPU 友好（固定形状+批量+JIT）并带 graceful fallback。"""
+    """VideoPrism wrapper（固定形状+批量+JIT），**严格 GPU**，无任何 CPU/lite 回退。"""
 
     def __init__(self, model_name: str = "videoprism_public_v1_base",
-                 device: str = "cpu", threads: int | None = None, force_lite: bool = False):
+                 device: str = "cuda", threads: int | None = None):
         self.model_name = model_name
-        self.device = (device or "cpu").lower()
+        self.device = (device or "cuda").lower()
         self.threads = threads
-        self.force_lite = force_lite
         self.embed_dim = 768
-        self._backend = None
         self._encode_fn = None     # JIT 后的批量函数
+        self._params = None
         self._init_backend()
 
     def _init_backend(self):
         logger = logging.getLogger(__name__)
-
-        if self.force_lite:
-            logger.info("VPR backend: forced lite embedding")
-            self._backend = ("lite", None)
-            self.embed_dim = 256
-            return
-
         try:
             import jax
             import jax.numpy as jnp
             from jax import tree_util
             from videoprism import models as vp
 
-            # 设备选择
-            try:
-                logger.info("JAX devices: %s", jax.devices())
-            except Exception:
-                pass
-            all_devs = list(jax.devices())
-            gpu_devs = [d for d in all_devs if getattr(d, "platform", "") == "gpu"]
-            cpu_devs = [d for d in all_devs if getattr(d, "platform", "") == "cpu"]
-            want_gpu = (self.device in ("gpu", "cuda")) or (self.device == "cpu" and len(gpu_devs) > 0)
-            chosen = gpu_devs[0] if (want_gpu and gpu_devs) else (cpu_devs[0] if cpu_devs else (all_devs[0] if all_devs else None))
-            if chosen is None:
-                raise RuntimeError("No JAX devices available")
+            # 打印设备并**强制**选择 GPU
+            devs = list(jax.devices())
+            logger.info("JAX devices: %s", devs)
+            gpu_devs = [d for d in devs if getattr(d, "platform", "") == "gpu"]
+            if not gpu_devs:
+                raise RuntimeError("未检测到 JAX GPU 设备；请检查 jax/jaxlib/cuda/cuDNN 安装与 JAX_PLATFORMS=cuda")
+
+            chosen = gpu_devs[0]
             logger.info("VPR using device: %s", chosen)
 
             # 加载模型与权重
             model = vp.get_model(self.model_name)
             params = vp.load_pretrained_weights(self.model_name)
             params = jax.device_put(params, chosen)
+            self._params = params
 
-            # --- 批量 JIT 编码函数（固定 [B,T,H,W,C] 形状） ---
-            def _apply(params, x_bthwc):
+            # --- 批量 JIT 编码函数（固定 [B,T,H,W,C] 形状），**无回退** ---
+            def _apply(p, x_bthwc):
                 # x_bthwc: [B,T,H,W,C] float32 in [0,1]
-                out = model.apply(params, x_bthwc, train=False)
+                out = model.apply(p, x_bthwc, train=False)
                 leaves = tree_util.tree_leaves(out)
                 emb = None
                 for leaf in leaves:
@@ -135,24 +121,28 @@ class VPRemb:
                         emb = leaf  # 期望 [B,T,D]
                         break
                 if emb is None:
-                    raise ValueError("VideoPrism apply() did not return array-like embedding")
+                    raise ValueError("VideoPrism apply() 未返回数组型 embedding")
                 if emb.ndim == 3:
                     emb = emb.mean(axis=1)  # [B,T,D] → [B,D]
                 return emb  # [B,D]
 
-            # 指定在 GPU 上编译；捐赠输入以减少拷贝
             self._encode_fn = jax.jit(_apply, donate_argnums=(1,), backend="gpu")
-            # Warmup：编译一次（避免首批耗时 + tegrastats 长时间 0%）
-            dummy = np.zeros((1, TARGET_T, TARGET_H, TARGET_W, 3), dtype=np.float32)
-            _ = np.array(self._encode_fn(params, dummy))  # 触发编译
 
-            self._backend = ("jax", (params, self._encode_fn))
-            self.embed_dim = 768
-            logger.info("VPR backend: JAX/VideoPrism (batched, jit, fixed-shape)")
+            # Warmup：编译一次；失败就直接抛错（不再回退）
+            dummy = np.zeros((1, TARGET_T, TARGET_H, TARGET_W, 3), dtype=np.float32)
+            _ = np.array(self._encode_fn(self._params, dummy))
+
+            logger.info("VPR backend: JAX/VideoPrism (batched, jit, fixed-shape, STRICT GPU)")
         except Exception as e:
-            logging.getLogger(__name__).warning(f"Falling back to lite embedding backend ({e})")
-            self._backend = ("lite", None)
-            self.embed_dim = 256
+            # 直接失败，抛出清晰错误信息
+            raise RuntimeError(
+                f"VPR GPU 后端初始化失败：{e}\n"
+                "请检查：\n"
+                "- jax/jaxlib 版本是否为 0.5.0 且加载到 CudaDevice\n"
+                "- CUDA/cuDNN 是否匹配（XLA_FLAGS 已设置 cuda_data_dir）\n"
+                "- 形状是否固定（TARGET_T/H/W），批量是否过大（BATCH_SIZE）\n"
+                "- 首次编译报错可尝试降低 RECMATCHER_VPR_T/BATCH_SIZE"
+            ) from e
 
     def _prep_clip(self, x: np.ndarray) -> np.ndarray:
         """统一 clip 为 [TARGET_T, TARGET_H, TARGET_W, 3] float32 in [0,1]。"""
@@ -166,64 +156,37 @@ class VPRemb:
         x = _resize_hw(x, TARGET_H, TARGET_W)
         return x
 
-    def _lite_embed(self, clip: np.ndarray) -> np.ndarray:
-        # clip: [T,H,W,C] float32 0-1
-        T, H, W, C = clip.shape
-        x = clip
-        feats = []
-        feats.extend(x.mean(axis=(0, 1, 2)).tolist())
-        feats.extend(x.std(axis=(0, 1, 2)).tolist())
-        small = cv2.resize((x.mean(axis=0)), (64, 64))
-        hsv = cv2.cvtColor((small * 255).astype(np.uint8), cv2.COLOR_RGB2HSV)
-        h_hist = np.histogram(hsv[:, :, 0], bins=16, range=(0, 255))[0]
-        s_hist = np.histogram(hsv[:, :, 1], bins=16, range=(0, 255))[0]
-        v_hist = np.histogram(hsv[:, :, 2], bins=16, range=(0, 255))[0]
-        hist = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)
-        hist = hist / (np.linalg.norm(hist) + 1e-6)
-        feats.extend(hist.tolist())
-        diff = np.abs(np.diff(x.mean(axis=(2, 3)), axis=0)).mean()
-        feats.append(float(diff))
-        vec = np.array(feats, dtype=np.float32)
-        D = 256
-        if vec.shape[0] < D:
-            vec = np.pad(vec, (0, D - vec.shape[0]))
-        else:
-            vec = vec[:D]
-        return vec
-
     def encode_batch(self, clips: List[np.ndarray]) -> np.ndarray:
-        """将一组 clip 编码为 [N,D]；内部自动做固定形状、批处理与容错。"""
+        """将一组 clip 编码为 [N,D]；固定形状+批量+JIT，**任何异常直接抛出**。"""
         if not clips:
             return np.zeros((0, self.embed_dim), dtype=np.float32)
 
-        backend, payload = self._backend
-        out_vecs = []
+        if self._encode_fn is None or self._params is None:
+            raise RuntimeError("VPR GPU 后端未正确初始化")
+
+        import jax  # 局部导入便于报错时打印信息
         logger = logging.getLogger(__name__)
 
-        if backend == "jax":
-            params, encode_fn = payload
-            batch = []
-            for idx, c in enumerate(clips):
+        # 批量组织
+        out_vecs = []
+        batch = []
+        for idx, c in enumerate(clips):
+            x = self._prep_clip(c)          # [T,H,W,C]
+            batch.append(x)
+            if len(batch) == BATCH_SIZE or idx == len(clips) - 1:
+                bx = np.stack(batch, axis=0)  # [B,T,H,W,C]
                 try:
-                    x = self._prep_clip(c)            # [T,H,W,C]
-                    batch.append(x)
-                    if len(batch) == BATCH_SIZE or idx == len(clips) - 1:
-                        bx = np.stack(batch, axis=0)  # [B,T,H,W,C]
-                        vecs = np.array(encode_fn(params, bx))  # [B,D]
-                        if vecs.ndim != 2:
-                            raise ValueError(f"unexpected VPR output shape {vecs.shape}")
-                        out_vecs.append(vecs.astype(np.float32))
-                        batch.clear()
+                    vecs = np.array(self._encode_fn(self._params, bx))  # [B,D]
                 except Exception as e:
-                    logger.warning(f"VPR JAX encode failed at idx={idx} ({e!r}); falling back to lite for this clip.")
-                    # 单个失败回落到 lite，不影响整批
-                    if 'x' not in locals():
-                        x = self._prep_clip(c)
-                    out_vecs.append(self._lite_embed(x)[None, ...].astype(np.float32))
-            return np.concatenate(out_vecs, axis=0)
+                    # 打印更丰富的上下文再抛出
+                    logger.error(
+                        "VPR GPU 编码失败：batch_size=%d, shape=%s, devices=%s",
+                        len(batch), bx.shape, jax.devices()
+                    )
+                    raise
+                if vecs.ndim != 2:
+                    raise ValueError(f"VPR 输出维度异常：{vecs.shape}（期望 [B,D]）")
+                out_vecs.append(vecs.astype(np.float32))
+                batch.clear()
 
-        # lite 路径（或 forced lite）
-        for c in clips:
-            x = self._prep_clip(c)    # 同样固定形状，便于后续对齐
-            out_vecs.append(self._lite_embed(x).astype(np.float32))
-        return np.stack(out_vecs, axis=0).astype(np.float32)
+        return np.concatenate(out_vecs, axis=0)
