@@ -3,25 +3,26 @@ import numpy as np
 import logging
 import os
 
-# ---------------- 在导入 JAX 之前，设置 XLA/JAX 环境，避免 Jetson 上的 FATAL ----------------
-def _append_xla_flag(flag: str):
-    xf = os.environ.get("XLA_FLAGS", "")
-    if flag not in xf:
-        os.environ["XLA_FLAGS"] = (xf + " " + flag).strip()
+# ---------------- 在导入 JAX 之前，设置 XLA/JAX 环境（兼容 jaxlib==0.5.0） ----------------
+def _set_xla_flags(flags: list[str]):
+    # 用支持的子集覆盖，避免旧版 XLA 因未知 flag 直接 FATAL
+    dedup = []
+    for f in flags:
+        if f and f not in dedup:
+            dedup.append(f)
+    os.environ["XLA_FLAGS"] = " ".join(dedup).strip()
 
-# 指定 CUDA 路径（防止找不到工具链/PTX）
-_append_xla_flag("--xla_gpu_cuda_data_dir=/usr/local/cuda")
-# 关闭红区分配器（RepeatBufferKernel 就来自这块）
-_append_xla_flag("--xla_gpu_enable_redzone_scratch_allocator=false")
-# 关闭/降级 GEMM 自动调优，避免编译/探测到不兼容内核
-_append_xla_flag("--xla_gpu_autotune_level=0")
-# 避免走 cublasLt 的一些 autotune 分支（可与上面叠加；若需要再放开）
-_append_xla_flag("--xla_gpu_use_cublaslt=false")
+# 仅保留 0.5.0 兼容的 flag
+_set_xla_flags([
+    "--xla_gpu_cuda_data_dir=/usr/local/cuda",
+    "--xla_gpu_autotune_level=0",   # 关闭 GEMM autotune，规避不兼容 kernel
+])
 
 # 其他建议设置（可减少显存占用和噪声）
-os.environ.setdefault("JAX_PLATFORMS", "cuda")                 # 不去探测 rocm/tpu
-os.environ.setdefault("JAX_ENABLE_X64", "0")                   # 省显存/更快
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.75")# 预分配 75% 显存
+os.environ.setdefault("JAX_PLATFORMS", "cuda")                  # 不去探测 rocm/tpu
+os.environ.setdefault("JAX_ENABLE_X64", "0")                    # 省显存/更快
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.75") # 预分配 75% 显存
+# ------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------
 
 # ---------------- JAX debug_info 兼容层（JAX>=0.5.0 已移除 api_util.debug_info）----------------
